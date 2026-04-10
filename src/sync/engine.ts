@@ -797,18 +797,23 @@ export class SyncEngine {
       );
       await this.backend.commitManifest({
         deviceId: this.deviceId,
-        files: uncommitted.map((entry: any) => ({
-          path: entry.path,
-          newPath: entry.newPath,
-          op: entry.op,
-          fileId: entry.fileId,
-          blobHash: entry.blobHash,
-          size: typeof entry.content === "string" ? entry.content.length : undefined,
-          mtime: entry.mtime || entry.ts,
-          lastModifiedBy: this.deviceId,
-          updatedAt: entry.ts,
-          seq: entry.seq
-        }))
+        files: uncommitted.map((entry: any) => {
+          const patch: Record<string, unknown> = {
+            path: entry.path,
+            op: entry.op,
+            fileId: entry.fileId,
+            lastModifiedBy: this.deviceId,
+            updatedAt: entry.ts,
+            seq: entry.seq
+          };
+          if (entry.newPath) patch.newPath = entry.newPath;
+          if (entry.op !== "delete") {
+            patch.blobHash = entry.blobHash;
+            patch.size = typeof entry.content === "string" ? entry.content.length : undefined;
+            patch.mtime = entry.mtime || entry.ts;
+          }
+          return patch;
+        })
       });
     } catch (error) {
       console.warn("obsidian-gdrive-sync: reconciliation failed", error);
