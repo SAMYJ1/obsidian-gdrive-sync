@@ -72,6 +72,8 @@ export interface ManifestPatchFile {
   op?: "create" | "modify" | "delete" | "rename";
   fileId?: string;
   blobHash?: string;
+  size?: number;
+  mtime?: number;
   lastModifiedBy?: string;
   updatedAt?: number;
   version?: number;
@@ -617,7 +619,7 @@ export class GoogleDriveClient {
     if (!existing) {
       this.manifestETag = null;
       this.manifestFileId = null;
-      return { version: 1, devices: {}, files: {} };
+      return { version: 2, devices: {}, files: {} };
     }
     this.manifestFileId = existing.id;
     const response = await this.request("GET", `/drive/v3/files/${existing.id}`, {
@@ -655,6 +657,8 @@ export class GoogleDriveClient {
           fileId: file.fileId ?? previousRecord.fileId ?? file.newPath,
           version: file.version ?? ((previousRecord.version ?? 0) + 1),
           blobHash: file.blobHash,
+          size: file.size,
+          mtime: file.mtime ?? now,
           lastModifiedBy: file.lastModifiedBy,
           updatedAt: file.updatedAt
         };
@@ -664,6 +668,8 @@ export class GoogleDriveClient {
           fileId: file.fileId ?? previousRecord.fileId ?? file.path,
           version: file.version ?? ((previousRecord.version ?? 0) + 1),
           blobHash: file.blobHash,
+          size: file.size,
+          mtime: file.mtime ?? now,
           lastModifiedBy: file.lastModifiedBy,
           updatedAt: file.updatedAt
         };
@@ -675,6 +681,8 @@ export class GoogleDriveClient {
     }
 
     manifest.devices[patch.deviceId] = {
+      ...(manifest.devices[patch.deviceId] ?? {}),
+      name: (manifest.devices[patch.deviceId]?.name) ?? patch.deviceId,
       lastSeenAt: now,
       opsHead,
       status: "active"
@@ -689,7 +697,8 @@ export class GoogleDriveClient {
 
   async writeCursor(deviceId: string, cursorVector: Record<string, number>): Promise<Record<string, number>> {
     await this.writeJson(`ops/cursors/${deviceId}.json`, {
-      cursors: cursorVector
+      cursors: cursorVector,
+      updatedAt: this.now()
     });
     return cursorVector;
   }

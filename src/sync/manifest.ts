@@ -16,6 +16,8 @@ export async function commitManifestPatch(input: CommitManifestPatchInput): Prom
         op: input.entry.op,
         fileId: input.entry.fileId,
         blobHash: input.entry.blobHash,
+        size: typeof input.entry.content === "string" ? input.entry.content.length : undefined,
+        mtime: input.entry.mtime || input.entry.ts,
         lastModifiedBy: input.deviceId,
         updatedAt: input.entry.ts,
         seq: input.entry.seq

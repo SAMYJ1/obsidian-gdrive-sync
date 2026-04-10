@@ -67,9 +67,13 @@ export async function coldStart(options: {
       }
     });
 
-    const snapshotFiles = await backend.downloadSnapshot(snapshotMetaBefore, settings);
+    const rawSnapshotFiles = await backend.downloadSnapshot(snapshotMetaBefore, settings);
+    const ignorePatterns = settings.ignorePatterns || [];
+    const snapshotFiles = (rawSnapshotFiles || []).filter(
+      (file: any) => !isIgnoredPath(file.path, ignorePatterns)
+    );
     if (vaultAdapter && typeof vaultAdapter.applySnapshot === "function") {
-      await vaultAdapter.applySnapshot(snapshotFiles || []);
+      await vaultAdapter.applySnapshot(snapshotFiles);
     }
 
     const snapshotMetaAfter = await backend.readSnapshotMeta(settings);
@@ -234,6 +238,7 @@ export class SyncEngine {
     state = bindReservedOperation(reservedState, reservedEntry.seq, {
       device: this.deviceId,
       ts: this.now(),
+      mtime: this.now(),
       op: change.op,
       path: change.path,
       fileId,
@@ -277,6 +282,7 @@ export class SyncEngine {
     state = bindReservedOperation(reservedState, reservedEntry.seq, {
       device: this.deviceId,
       ts: this.now(),
+      mtime: this.now(),
       op: "rename",
       path: oldPath,
       newPath,
@@ -456,7 +462,7 @@ export class SyncEngine {
                 fileId: hydratedEntry.fileId || existingFile.fileId || createFileId(),
                 version: hydratedEntry.version || ((existingFile.version || 0) + 1),
                 blobHash: (modifyResolution && modifyResolution.blobHash) || hydratedEntry.blobHash,
-                parentBlobHashes: hydratedEntry.parentBlobHashes || [],
+                parentBlobHashes: [localFile.blobHash, hydratedEntry.blobHash],
                 content: (modifyResolution && modifyResolution.content) || hydratedEntry.content,
                 lastModifiedBy: (modifyResolution && modifyResolution.lastModifiedBy) || hydratedEntry.device,
                 updatedAt: (modifyResolution && modifyResolution.updatedAt) || hydratedEntry.ts || this.now()
@@ -471,6 +477,26 @@ export class SyncEngine {
               await this.resolveDeleteModifyConflict(localFile, hydratedEntry);
               continue;
             }
+          }
+
+          // rename-vs-delete: remote deletes a file that was locally renamed
+          if (hydratedEntry.op === "delete" && localRenameFile && localRenameFile.renamedTo) {
+            const remoteParent = hydratedEntry.parentBlobHashes && hydratedEntry.parentBlobHashes[0];
+            const localContentChanged = remoteParent && localRenameFile.blobHash && localRenameFile.blobHash !== remoteParent;
+            if (localContentChanged) {
+              // Content was also modified during rename — apply delete-vs-modify rule at new path
+              await this.resolveDeleteModifyConflict(
+                { ...localRenameFile, path: localRenameFile.renamedTo },
+                { ...hydratedEntry, path: localRenameFile.renamedTo }
+              );
+            }
+            // Treat as delete: remove both old and new paths
+            state = removeTrackedFile(state, hydratedEntry.path);
+            state = removeTrackedFile(state, localRenameFile.renamedTo);
+            if (this.vaultAdapter && typeof this.vaultAdapter.applyRemoteOperation === "function") {
+              await this.vaultAdapter.applyRemoteOperation({ ...hydratedEntry, op: "delete", path: localRenameFile.renamedTo });
+            }
+            continue;
           }
 
           if (hydratedEntry.op === "rename" && localRenameFile && localRenameFile.renamedTo) {
@@ -502,7 +528,7 @@ export class SyncEngine {
                 fileId: hydratedEntry.fileId || localFile.fileId || createFileId(),
                 version: (localFile.version || 0) + 1,
                 blobHash: (renameResolution && renameResolution.blobHash) || hydratedEntry.blobHash,
-                parentBlobHashes: hydratedEntry.parentBlobHashes || [],
+                parentBlobHashes: [localFile.blobHash, hydratedEntry.blobHash],
                 content: (renameResolution && renameResolution.content) || hydratedEntry.content,
                 lastModifiedBy: (renameResolution && renameResolution.lastModifiedBy) || hydratedEntry.device,
                 updatedAt: (renameResolution && renameResolution.updatedAt) || hydratedEntry.ts || this.now()
@@ -773,8 +799,16 @@ export class SyncEngine {
     }
 
     const snapshotMeta = await this.backend.readSnapshotMeta(settings);
-    const allCursors = await this.backend.listCursorVectors();
-    const floor = computeCompactionFloor(allCursors, snapshotMeta && snapshotMeta.snapshotSeqs, this.deviceId);
+    const allCursorVectors = await this.backend.listCursorVectors();
+    // Filter out inactive device cursors per spec §3: compaction ignores inactive devices
+    const manifest = await this.backend.readManifest();
+    const activeCursors = allCursorVectors
+      .filter((cv: { deviceId: string; cursors: Record<string, number> }) => {
+        const device = manifest.devices?.[cv.deviceId];
+        return !device || device.status !== "inactive";
+      })
+      .map((cv: { cursors: Record<string, number> }) => cv.cursors);
+    const floor = computeCompactionFloor(activeCursors, snapshotMeta && snapshotMeta.snapshotSeqs, this.deviceId);
     if (!floor || floor <= 0) {
       return null;
     }

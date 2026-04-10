@@ -29,6 +29,7 @@ export async function pushOutboxEntry(input: PushOutboxEntryInput): Promise<any>
         fileId: entry.fileId,
         blobHash: entry.blobHash,
         parentBlobHashes: entry.parentBlobHashes,
+        mtime: entry.mtime || entry.ts,
         ts: entry.ts
       })
     );
