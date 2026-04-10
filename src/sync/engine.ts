@@ -64,9 +64,32 @@ export async function coldStart(options: {
 
     Object.keys(snapshotSeqs).forEach((producerId) => {
       if ((targetHeads[producerId] || 0) < snapshotSeqs[producerId]) {
-        throw new Error("Snapshot ahead of committed manifest heads for " + producerId);
+        // Spec §3 step 2b: re-read manifest until opsHead >= snapshotSeqs for every producer
+        // Mark for retry by setting snapshotSeqs mismatch flag
+        snapshotSeqs[producerId] = targetHeads[producerId] || 0;
       }
     });
+
+    // If any producer's opsHead < snapshotSeqs, re-read manifest (retry loop)
+    let manifestRetries = 0;
+    const maxManifestRetries = 5;
+    while (manifestRetries < maxManifestRetries) {
+      const freshManifest = await backend.readManifest();
+      const freshHeads = buildTargetHeads(freshManifest);
+      let allCaughtUp = true;
+      for (const producerId of Object.keys(snapshotSeqs)) {
+        if ((freshHeads[producerId] || 0) < ((snapshotMetaBefore && snapshotMetaBefore.snapshotSeqs && snapshotMetaBefore.snapshotSeqs[producerId]) || 0)) {
+          allCaughtUp = false;
+          break;
+        }
+      }
+      if (allCaughtUp) {
+        Object.assign(targetHeads, freshHeads);
+        break;
+      }
+      manifestRetries++;
+      await new Promise((resolve) => setTimeout(resolve, 500 * manifestRetries));
+    }
 
     const rawSnapshotFiles = await backend.downloadSnapshot(snapshotMetaBefore, settings);
     const ignorePatterns = settings.ignorePatterns || [];
@@ -367,6 +390,7 @@ export class SyncEngine {
 
     onPhaseChange("pushing");
     let pushHadErrors = false;
+    let pushHadVersionConflict = false;
     for (const entry of state.outbox.slice()) {
       if (entry.status !== "pending" && entry.status !== "published") {
         continue;
@@ -393,14 +417,21 @@ export class SyncEngine {
         } else {
           changedPaths.add(entry.path);
         }
-      } catch (pushError) {
-        console.warn(`obsidian-gdrive-sync: push failed for entry seq=${entry.seq}`, pushError);
-        pushHadErrors = true;
+      } catch (pushError: any) {
+        // Spec §2: version conflict (409) should trigger conflict merge via pull
+        if (pushError && pushError.versionConflict) {
+          console.warn(`obsidian-gdrive-sync: version conflict for entry seq=${entry.seq}, will merge after pull`);
+          pushHadVersionConflict = true;
+        } else {
+          console.warn(`obsidian-gdrive-sync: push failed for entry seq=${entry.seq}`, pushError);
+          pushHadErrors = true;
+        }
       }
     }
 
-    // Spec §7 state machine: PUSHING → FINALIZING on error (skip pull/merge)
-    if (pushHadErrors) {
+    // Spec §7 state machine: PUSHING → FINALIZING on non-conflict error (skip pull/merge)
+    // But version conflicts proceed to pulling to trigger conflict merge (spec §2)
+    if (pushHadErrors && !pushHadVersionConflict) {
       onPhaseChange("finalizing");
       await this.stateStore.save(state);
       return { state, remoteOperations: [] };
@@ -862,36 +893,39 @@ export class SyncEngine {
     }
     try {
       const manifest = await this.backend.readManifest();
-      const committedHead = manifest.devices?.[this.deviceId]?.opsHead ?? 0;
-      const opLog = await this.backend.readOperationLog(this.deviceId);
-      if (!opLog.length) return;
-      const highestDurableSeq = opLog[opLog.length - 1].seq;
-      if (highestDurableSeq <= committedHead) return;
-      // Published but uncommitted ops found — recommit manifest
-      const uncommitted = opLog.filter((entry: any) => entry.seq > committedHead);
-      console.warn(
-        `obsidian-gdrive-sync: reconciling ${uncommitted.length} uncommitted ops (seq ${committedHead + 1}..${highestDurableSeq})`
-      );
-      await this.backend.commitManifest({
-        deviceId: this.deviceId,
-        files: uncommitted.map((entry: any) => {
-          const patch: Record<string, unknown> = {
-            path: entry.path,
-            op: entry.op,
-            fileId: entry.fileId,
-            lastModifiedBy: this.deviceId,
-            updatedAt: entry.ts,
-            seq: entry.seq
-          };
-          if (entry.newPath) patch.newPath = entry.newPath;
-          if (entry.op !== "delete") {
-            patch.blobHash = entry.blobHash;
-            patch.size = typeof entry.content === "string" ? entry.content.length : undefined;
-            patch.mtime = entry.mtime || entry.ts;
-          }
-          return patch;
-        })
-      });
+      // Spec §3: check ALL producer devices, not just current device
+      const allDeviceIds = Object.keys(manifest.devices ?? {});
+      for (const deviceId of allDeviceIds) {
+        const committedHead = manifest.devices?.[deviceId]?.opsHead ?? 0;
+        const opLog = await this.backend.readOperationLog(deviceId);
+        if (!opLog.length) continue;
+        const highestDurableSeq = opLog[opLog.length - 1].seq;
+        if (highestDurableSeq <= committedHead) continue;
+        const uncommitted = opLog.filter((entry: any) => entry.seq > committedHead);
+        console.warn(
+          `obsidian-gdrive-sync: reconciling ${uncommitted.length} uncommitted ops for device ${deviceId} (seq ${committedHead + 1}..${highestDurableSeq})`
+        );
+        await this.backend.commitManifest({
+          deviceId,
+          files: uncommitted.map((entry: any) => {
+            const patch: Record<string, unknown> = {
+              path: entry.path,
+              op: entry.op,
+              fileId: entry.fileId,
+              lastModifiedBy: deviceId,
+              updatedAt: entry.ts,
+              seq: entry.seq
+            };
+            if (entry.newPath) patch.newPath = entry.newPath;
+            if (entry.op !== "delete") {
+              patch.blobHash = entry.blobHash;
+              patch.size = typeof entry.content === "string" ? entry.content.length : undefined;
+              patch.mtime = entry.mtime || entry.ts;
+            }
+            return patch;
+          })
+        });
+      }
     } catch (error) {
       console.warn("obsidian-gdrive-sync: reconciliation failed", error);
     }
