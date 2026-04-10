@@ -1,0 +1,16 @@
+{
+  "name": "obsidian-gdrive-sync",
+  "version": "0.1.0",
+  "description": "Obsidian plugin for Google Drive sync with explicit snapshot publish modes.",
+  "private": true,
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "check": "tsc --noEmit",
+    "test": "tsc -p tsconfig.test.json && node tests/run-tests.js"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.0"
+  }
+}

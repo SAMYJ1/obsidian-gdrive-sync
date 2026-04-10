@@ -1,0 +1,9 @@
+{
+  "id": "obsidian-gdrive-sync",
+  "name": "Obsidian Google Drive Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.6.0",
+  "description": "Google Drive sync for Obsidian with explicit remote-apply state and snapshot publish modes.",
+  "author": "OpenAI Codex",
+  "isDesktopOnly": false
+}

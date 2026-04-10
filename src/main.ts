@@ -1,0 +1,376 @@
+const obsidian = require("obsidian");
+
+import { startOAuthFlow, fetchAccessToken } from "./drive/auth";
+import { GoogleDriveBackend } from "./drive/backend";
+import { GoogleDriveClient } from "./drive/client";
+import { GOOGLE_DRIVE_BACKEND_CAPABILITIES } from "./drive/provider";
+import { normalizeSettings, ObsidianGDriveSyncSettingTab, type PluginSettings } from "./settings";
+import { SyncEngine } from "./sync/engine";
+import { RuntimeStateStore } from "./sync/runtime-state";
+import { normalizeLocalState, updateChangesPageToken } from "./sync/state";
+import { createDeviceId } from "./utils/device";
+import { ObsidianVaultAdapter } from "./vault/adapter";
+import { BUILT_IN_IGNORE_PATHS } from "./vault/filter";
+import { GenerationPublisher } from "./vault/snapshot";
+import { createVaultWatcher } from "./vault/watcher";
+
+// --- Plugin data store (ported from lib/plugin-data-store.js) ---
+
+async function loadPluginData(plugin: any): Promise<any> {
+  const raw = await plugin.loadData();
+  return raw || {};
+}
+
+async function savePluginData(plugin: any, data: any): Promise<any> {
+  await plugin.saveData(data);
+  return data;
+}
+
+function createSettingsStore(plugin: any) {
+  return {
+    async load() {
+      const data = await loadPluginData(plugin);
+      return normalizeSettings(data.settings);
+    },
+    async save(settings: any) {
+      const data = await loadPluginData(plugin);
+      data.settings = normalizeSettings(settings);
+      await savePluginData(plugin, data);
+      return data.settings;
+    }
+  };
+}
+
+function createLocalStateStore(plugin: any) {
+  return {
+    async load() {
+      const data = await loadPluginData(plugin);
+      return normalizeLocalState(data.localState);
+    },
+    async save(localState: any) {
+      const data = await loadPluginData(plugin);
+      data.localState = normalizeLocalState(localState);
+      await savePluginData(plugin, data);
+      return data.localState;
+    }
+  };
+}
+
+function createObsidianFetch(obsidianModule: any) {
+  return async function obsidianFetch(url: string, init?: {
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string | Buffer;
+  }) {
+    if (typeof obsidianModule.requestUrl !== "function") {
+      return (globalThis.fetch as any)(url, init as any);
+    }
+    const options = {
+      url,
+      method: (init && init.method) || "GET",
+      headers: init && init.headers ? { ...init.headers } : {},
+      body: init && init.body ? init.body : undefined,
+      throw: false
+    };
+    const result = await obsidianModule.requestUrl(options);
+    return {
+      ok: result.status >= 200 && result.status < 300,
+      status: result.status,
+      headers: {
+        get(name: string) {
+          const lower = name.toLowerCase();
+          const headers = result.headers || {};
+          for (const key in headers) {
+            if (key.toLowerCase() === lower) return headers[key];
+          }
+          return null;
+        }
+      },
+      text() {
+        return Promise.resolve(typeof result.text === "string" ? result.text : JSON.stringify(result.json));
+      },
+      json() {
+        return Promise.resolve(result.json);
+      },
+      arrayBuffer() {
+        if (result.arrayBuffer) {
+          return Promise.resolve(result.arrayBuffer);
+        }
+        return Promise.resolve(Buffer.from(typeof result.text === "string" ? result.text : JSON.stringify(result.json)));
+      }
+    };
+  };
+}
+
+class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
+  settings!: PluginSettings;
+  localState: any;
+  settingsStore: any;
+  stateStore: any;
+  runtimeStateStore: any;
+  driveClient: any;
+  generationPublisher: any;
+  backend: any;
+  vaultAdapter: any;
+  syncEngine: any;
+  debouncedSyncNow: any;
+  pollIntervalHandle: any;
+  syncInFlight = false;
+
+  async onload(): Promise<void> {
+    const rawData = await loadPluginData(this);
+    this.settings = normalizeSettings(rawData.settings);
+    this.localState = rawData.localState || {};
+    if (!this.localState.deviceId) {
+      this.localState.deviceId = createDeviceId("mac");
+      await savePluginData(this, {
+        settings: this.settings,
+        localState: this.localState
+      });
+    }
+
+    this.settingsStore = createSettingsStore(this);
+    this.stateStore = createLocalStateStore(this);
+    this.runtimeStateStore = new RuntimeStateStore({
+      statePath: this.getRuntimeStatePath(),
+      cooldownMs: this.settings.remoteApplyCooldownMs
+    });
+    this.runtimeStateStore.recoverIfStale();
+
+    this.driveClient = new GoogleDriveClient({
+      fetchImpl: createObsidianFetch(obsidian),
+      getAccessToken: () => fetchAccessToken(this.settingsStore, createObsidianFetch(obsidian) as any),
+      rootFolderName: this.settings.rootFolderName,
+      vaultName: this.app.vault.getName()
+    });
+    this.generationPublisher = new GenerationPublisher({
+      driveClient: this.driveClient,
+      generationRetentionCount: this.settings.generationRetentionCount
+    });
+    this.backend = new GoogleDriveBackend({
+      driveClient: this.driveClient,
+      generationPublisher: this.generationPublisher
+    });
+    this.vaultAdapter = new ObsidianVaultAdapter({
+      app: this.app,
+      backend: this.backend
+    });
+    this.syncEngine = new SyncEngine({
+      deviceId: this.localState.deviceId,
+      backend: this.backend,
+      settingsStore: this.settingsStore,
+      stateStore: this.stateStore,
+      runtimeStateStore: this.runtimeStateStore,
+      vaultAdapter: this.vaultAdapter
+    });
+
+    this.addSettingTab(new ObsidianGDriveSyncSettingTab(this.app, this));
+    this.addCommand({
+      id: "show-runtime-state-path",
+      name: "Show runtime state path",
+      callback: () => {
+        new obsidian.Notice(this.getRuntimeStatePath());
+      }
+    });
+    this.addCommand({
+      id: "sync-now",
+      name: "Sync now",
+      callback: async () => {
+        await this.runSyncNow();
+      }
+    });
+    this.registerVaultEvents();
+    this.registerForegroundPollingHooks();
+    this.startPolling();
+    this.runInitialSyncIfNeeded().catch((error: unknown) => {
+      console.warn("obsidian-gdrive-sync: initial sync failed", error);
+    });
+  }
+
+  async onunload(): Promise<void> {
+    this.stopPolling();
+    await this.saveSettings();
+  }
+
+  getRuntimeStatePath(): string {
+    return this.app.vault.configDir + "/plugins/" + this.manifest.id + "/runtime-state.json";
+  }
+
+  getBuiltInIgnorePaths(): string[] {
+    return BUILT_IN_IGNORE_PATHS.slice();
+  }
+
+  getBackendCapabilities(): unknown {
+    return GOOGLE_DRIVE_BACKEND_CAPABILITIES;
+  }
+
+  async saveSettings(): Promise<void> {
+    this.settings = normalizeSettings(this.settings);
+    await savePluginData(this, {
+      settings: this.settings,
+      localState: this.localState
+    });
+  }
+
+  shouldSuppressRemoteApplyEvent(filePath: string, atTime: number): boolean {
+    return this.runtimeStateStore.shouldSuppressPath(filePath, atTime);
+  }
+
+  registerVaultEvents(): void {
+    createVaultWatcher({
+      app: this.app,
+      vaultAdapter: this.vaultAdapter,
+      syncEngine: this.syncEngine,
+      registerEvent: this.registerEvent.bind(this),
+      shouldSuppressRemoteApplyEvent: this.shouldSuppressRemoteApplyEvent.bind(this),
+      scheduleSync: this.scheduleSync.bind(this)
+    });
+  }
+
+  scheduleSync(): void {
+    if (!this.debouncedSyncNow) {
+      this.debouncedSyncNow = obsidian.debounce(
+        () => this.runSyncNow().catch((error: unknown) => new obsidian.Notice(String(error))),
+        this.settings.pushDebounceMs,
+        true
+      );
+    }
+    this.debouncedSyncNow();
+  }
+
+  startPolling(): void {
+    this.stopPolling();
+    if (!this.shouldAutoPoll()) {
+      return;
+    }
+    this.pollIntervalHandle = window.setInterval(() => {
+      this.pollForChanges().catch((error: unknown) => new obsidian.Notice(String(error)));
+    }, this.settings.pollIntervalSeconds * 1000);
+  }
+
+  stopPolling(): void {
+    if (this.pollIntervalHandle) {
+      window.clearInterval(this.pollIntervalHandle);
+      this.pollIntervalHandle = null;
+    }
+  }
+
+  async pollForChanges(): Promise<void> {
+    if (this.syncInFlight) return;
+    try {
+      let state = await this.stateStore.load();
+      if (!state.changesPageToken) {
+        const token = await this.backend.getStartPageToken();
+        state = updateChangesPageToken(state, token);
+        await this.stateStore.save(state);
+        if (this.isColdStartCandidate(state)) {
+          await this.runSyncNow();
+          return;
+        }
+      }
+      const result = await this.backend.listChanges(state.changesPageToken);
+      const hasChanges = (result.changes || []).some((change: any) => {
+        if (change.removed) {
+          return true;
+        }
+        const props = change.file && change.file.appProperties;
+        return props && props.vault === this.app.vault.getName();
+      });
+      if (result.newStartPageToken || result.nextPageToken) {
+        state = await this.stateStore.load();
+        state = updateChangesPageToken(state, result.newStartPageToken || result.nextPageToken);
+        await this.stateStore.save(state);
+      }
+      if (hasChanges) {
+        await this.runSyncNow();
+      }
+    } catch (error) {
+      console.warn("obsidian-gdrive-sync: poll failed, falling back to full sync", error);
+      await this.runSyncNow();
+    }
+  }
+
+  async runSyncNow(): Promise<void> {
+    if (this.syncInFlight) {
+      return;
+    }
+    this.syncInFlight = true;
+    try {
+      await this.syncEngine.syncNow();
+    } finally {
+      this.syncInFlight = false;
+    }
+  }
+
+  async runInitialSyncIfNeeded(): Promise<void> {
+    if (!this.settings.enableAutoSync) {
+      return;
+    }
+    const state = await this.stateStore.load();
+    if (this.isColdStartCandidate(state)) {
+      await this.runSyncNow();
+    }
+  }
+
+  isColdStartCandidate(state: any): boolean {
+    const current = state || {};
+    return Object.keys(current.cursorByDevice || {}).length === 0 &&
+      Object.keys(current.files || {}).length === 0;
+  }
+
+  shouldAutoPoll(): boolean {
+    if (!this.settings.enableAutoSync || this.settings.pollIntervalSeconds <= 0) {
+      return false;
+    }
+    if (this.settings.pollMode === "manual") {
+      return false;
+    }
+    if (this.settings.pollMode === "always") {
+      return true;
+    }
+    if (typeof document === "undefined") {
+      return true;
+    }
+    return document.visibilityState !== "hidden";
+  }
+
+  registerForegroundPollingHooks(): void {
+    if (typeof document !== "undefined") {
+      this.registerDomEvent(document, "visibilitychange", () => {
+        this.startPolling();
+        if (this.settings.pollMode === "foreground" && document.visibilityState !== "hidden") {
+          this.runSyncNow().catch((error: unknown) => new obsidian.Notice(String(error)));
+        }
+      });
+    }
+    if (typeof window !== "undefined") {
+      this.registerDomEvent(window, "focus", () => {
+        if (this.settings.pollMode === "foreground") {
+          this.startPolling();
+          this.runSyncNow().catch((error: unknown) => new obsidian.Notice(String(error)));
+        }
+      });
+    }
+  }
+
+  async startGoogleAuth(): Promise<void> {
+    if (!this.settings.googleClientId) {
+      throw new Error("Google client ID is required before starting OAuth");
+    }
+    const tokenSet = await startOAuthFlow({
+      clientId: this.settings.googleClientId,
+      clientSecret: this.settings.googleClientSecret,
+      tokenEndpoint: this.settings.googleTokenEndpoint,
+      fetchImpl: createObsidianFetch(obsidian) as any
+    });
+    this.settings.googleAccessToken = tokenSet.accessToken;
+    this.settings.googleAccessTokenExpiresAt = tokenSet.expiresAt;
+    if (tokenSet.refreshToken) {
+      this.settings.googleRefreshToken = tokenSet.refreshToken;
+    }
+    await this.saveSettings();
+    new obsidian.Notice("Google Drive authentication complete.");
+  }
+}
+
+module.exports = ObsidianGDriveSyncPlugin;
