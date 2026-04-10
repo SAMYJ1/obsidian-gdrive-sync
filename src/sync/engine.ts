@@ -552,16 +552,38 @@ export class SyncEngine {
               this.lastSyncHadConflicts = true;
               const modifyResolution = await this.resolveModifyConflict(state, localFile, hydratedEntry);
               const existingFile = state.files[hydratedEntry.path] || {};
+              const mergedBlobHash = (modifyResolution && modifyResolution.blobHash) || hydratedEntry.blobHash;
+              const mergedContent = (modifyResolution && modifyResolution.content) || hydratedEntry.content;
+              const mergedFileId = hydratedEntry.fileId || existingFile.fileId || createFileId();
+              const mergedVersion = ((existingFile.version || 0) + 1);
               state = updateTrackedFile(state, {
                 path: hydratedEntry.path,
-                fileId: hydratedEntry.fileId || existingFile.fileId || createFileId(),
-                version: hydratedEntry.version || ((existingFile.version || 0) + 1),
-                blobHash: (modifyResolution && modifyResolution.blobHash) || hydratedEntry.blobHash,
+                fileId: mergedFileId,
+                version: mergedVersion,
+                blobHash: mergedBlobHash,
                 parentBlobHashes: [localFile.blobHash, hydratedEntry.blobHash],
-                content: (modifyResolution && modifyResolution.content) || hydratedEntry.content,
-                lastModifiedBy: (modifyResolution && modifyResolution.lastModifiedBy) || hydratedEntry.device,
-                updatedAt: (modifyResolution && modifyResolution.updatedAt) || hydratedEntry.ts || this.now()
+                content: mergedContent,
+                lastModifiedBy: this.deviceId,
+                updatedAt: this.now()
               });
+
+              // Spec §3 step 4: upload merged blob + emit modify op with two parents
+              const reservedState = reserveOperation(state);
+              await this.stateStore.save(reservedState);
+              const reservedEntry = reservedState.outbox[reservedState.outbox.length - 1];
+              state = bindReservedOperation(reservedState, reservedEntry.seq, {
+                device: this.deviceId,
+                ts: this.now(),
+                mtime: this.now(),
+                op: "modify",
+                path: hydratedEntry.path,
+                fileId: mergedFileId,
+                blobHash: mergedBlobHash,
+                parentBlobHashes: [localFile.blobHash, hydratedEntry.blobHash],
+                content: mergedContent,
+                version: mergedVersion
+              });
+              await this.stateStore.save(state);
               continue;
             }
           }
