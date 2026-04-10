@@ -179,9 +179,9 @@ export function computeCompactionFloor(
       cursorVector && typeof cursorVector[producerId] === "number" ? cursorVector[producerId] : Infinity
     )
     .filter((value) => Number.isFinite(value));
-  const minActiveCursor = activeCursorValues.length > 0 ? Math.min(...activeCursorValues) : 0;
+  const minActiveCursor = activeCursorValues.length > 0 ? Math.min(...activeCursorValues) : null;
   const snapshotFloor = snapshotSeqs && typeof snapshotSeqs[producerId] === "number" ? snapshotSeqs[producerId] : 0;
-  if (!minActiveCursor) {
+  if (minActiveCursor === null) {
     return snapshotFloor;
   }
   return Math.min(minActiveCursor, snapshotFloor);
@@ -349,7 +349,7 @@ export class SyncEngine {
     state = updateTrackedFile(state, {
       path: newPath,
       fileId,
-      version: existingFile ? existingFile.version : 1,
+      version: existingFile ? nextVersion : 1,
       blobHash,
       parentBlobHashes: parentBlobHash ? [parentBlobHash] : [],
       content,
@@ -602,18 +602,22 @@ export class SyncEngine {
             const remoteParent = hydratedEntry.parentBlobHashes && hydratedEntry.parentBlobHashes[0];
             const localContentChanged = remoteParent && localRenameFile.blobHash && localRenameFile.blobHash !== remoteParent;
             if (localContentChanged) {
-              // Content was also modified during rename — apply delete-vs-modify rule at new path
+              // Content was also modified during rename — apply delete-vs-modify rule
+              // Spec: restore file with conflict marker, user sees modified version alongside conflict copy
               this.lastSyncHadConflicts = true;
               await this.resolveDeleteModifyConflict(
                 { ...localRenameFile, path: localRenameFile.renamedTo },
                 { ...hydratedEntry, path: localRenameFile.renamedTo }
               );
-            }
-            // Treat as delete: remove both old and new paths
-            state = removeTrackedFile(state, hydratedEntry.path);
-            state = removeTrackedFile(state, localRenameFile.renamedTo);
-            if (this.vaultAdapter && typeof this.vaultAdapter.applyRemoteOperation === "function") {
-              await this.vaultAdapter.applyRemoteOperation({ ...hydratedEntry, op: "delete", path: localRenameFile.renamedTo });
+              // Remove only the old path; keep the renamed (modified) file
+              state = removeTrackedFile(state, hydratedEntry.path);
+            } else {
+              // No content change — treat as simple delete of both paths
+              state = removeTrackedFile(state, hydratedEntry.path);
+              state = removeTrackedFile(state, localRenameFile.renamedTo);
+              if (this.vaultAdapter && typeof this.vaultAdapter.applyRemoteOperation === "function") {
+                await this.vaultAdapter.applyRemoteOperation({ ...hydratedEntry, op: "delete", path: localRenameFile.renamedTo });
+              }
             }
             continue;
           }
