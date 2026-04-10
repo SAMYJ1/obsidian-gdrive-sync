@@ -2,11 +2,24 @@ export class GoogleDriveBackend {
   private readonly driveClient: any;
   private readonly generationPublisher: any;
   private readonly now: () => number;
+  private readonly concurrency: number;
 
-  constructor(options: { driveClient: any; generationPublisher?: any; now?: () => number }) {
+  constructor(options: { driveClient: any; generationPublisher?: any; now?: () => number; concurrency?: number }) {
     this.driveClient = options.driveClient;
     this.generationPublisher = options.generationPublisher;
     this.now = options.now || (() => Date.now());
+    this.concurrency = options.concurrency ?? 5;
+  }
+
+  private async runConcurrent<T>(items: T[], fn: (item: T) => Promise<void>): Promise<void> {
+    const queue = items.slice();
+    const workers = Array.from({ length: Math.min(this.concurrency, queue.length) }, async () => {
+      while (queue.length > 0) {
+        const item = queue.shift()!;
+        await fn(item);
+      }
+    });
+    await Promise.all(workers);
   }
 
   async uploadBlob(change: any): Promise<any> {
@@ -96,12 +109,12 @@ export class GoogleDriveBackend {
       return this.generationPublisher.publish(input);
     }
 
-    for (const file of input.files || []) {
+    await this.runConcurrent(input.files || [], async (file: any) => {
       await this.driveClient.writeSnapshotFile(file.path, file.content);
-    }
-    for (const deletedPath of input.deletedFiles || []) {
+    });
+    await this.runConcurrent(input.deletedFiles || [], async (deletedPath: any) => {
       await this.driveClient.deletePath(deletedPath);
-    }
+    });
     await this.driveClient.writeJson("vault/_snapshot_meta.json", {
       snapshotSeqs: input.snapshotSeqs || {},
       updatedAt: this.now()

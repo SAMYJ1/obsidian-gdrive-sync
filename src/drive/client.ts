@@ -246,6 +246,62 @@ export class GoogleDriveClient {
     return response.status === 204 ? {} : response.json();
   }
 
+  async batchMetadataRequests(
+    requests: Array<{ method: string; path: string; body?: string }>
+  ): Promise<Array<{ status: number; body: any }>> {
+    if (requests.length === 0) return [];
+    const accessToken = await this.getAccessToken();
+    const boundary = `batch_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const parts: string[] = [];
+    for (const req of requests) {
+      parts.push(
+        `--${boundary}\r\n` +
+        `Content-Type: application/http\r\n\r\n` +
+        `${req.method} ${req.path} HTTP/1.1\r\n` +
+        `Content-Type: application/json\r\n` +
+        (req.body ? `\r\n${req.body}\r\n` : `\r\n`)
+      );
+    }
+    parts.push(`--${boundary}--\r\n`);
+    const batchBody = parts.join("");
+    await this.rateLimiter.acquire(requests.length);
+    const response = await this.fetchImpl(`${this.baseUrl}/batch/drive/v3`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": `multipart/mixed; boundary=${boundary}`
+      },
+      body: batchBody
+    });
+    const responseText = await response.text();
+    return this.parseBatchResponse(responseText);
+  }
+
+  private parseBatchResponse(responseText: string): Array<{ status: number; body: any }> {
+    const results: Array<{ status: number; body: any }> = [];
+    const boundaryMatch = responseText.match(/^--([^\r\n]+)/);
+    if (!boundaryMatch) return results;
+    const boundary = boundaryMatch[1];
+    const parts = responseText.split(`--${boundary}`).slice(1, -1);
+    for (const part of parts) {
+      const httpStart = part.indexOf("HTTP/1.1");
+      if (httpStart === -1) {
+        results.push({ status: 0, body: null });
+        continue;
+      }
+      const statusMatch = part.slice(httpStart).match(/HTTP\/1\.1 (\d+)/);
+      const status = statusMatch ? parseInt(statusMatch[1], 10) : 0;
+      const bodyStart = part.indexOf("\r\n\r\n", httpStart + 1);
+      let body: any = null;
+      if (bodyStart !== -1) {
+        const bodyText = part.slice(bodyStart + 4).trim();
+        try { body = JSON.parse(bodyText); } catch { body = bodyText; }
+      }
+      results.push({ status, body });
+    }
+    return results;
+  }
+
   buildAppProperties(logicalPath: string, kind: string): Record<string, string> {
     return {
       logicalPath,
@@ -842,17 +898,23 @@ export class GoogleDriveClient {
     );
 
     const results: Array<{ path: string; content: string }> = [];
-    for (const file of snapshotFiles) {
-      const logicalPath = file.appProperties?.logicalPath;
-      if (!logicalPath) {
-        continue;
+    // Concurrent downloads (up to 5 parallel requests)
+    const downloadQueue = snapshotFiles.filter((f) => f.appProperties?.logicalPath);
+    const concurrency = 5;
+    const queue = downloadQueue.slice();
+    const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
+      while (queue.length > 0) {
+        const file = queue.shift()!;
+        const logicalPath = file.appProperties!.logicalPath!;
+        const content = await this.readFile(logicalPath);
+        results.push({
+          path: logicalPath.slice(prefix.length),
+          content: content ?? ""
+        });
       }
-      const content = await this.readFile(logicalPath);
-      results.push({
-        path: logicalPath.slice(prefix.length),
-        content: content ?? ""
-      });
-    }
+    });
+    await Promise.all(workers);
+    results.sort((a, b) => a.path.localeCompare(b.path));
     return results;
   }
 

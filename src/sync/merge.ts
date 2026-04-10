@@ -15,6 +15,7 @@ export function isBinaryPath(filePath: string): boolean {
 }
 
 export function computeBlobHashSync(content: string): string {
+  // Synchronous hash for inline merge results; uses Node.js crypto (always available in Electron)
   return `sha256:${crypto.createHash("sha256").update(String(content || "")).digest("hex")}`;
 }
 
