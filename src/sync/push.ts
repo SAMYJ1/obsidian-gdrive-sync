@@ -18,20 +18,23 @@ export async function pushOutboxEntry(input: PushOutboxEntryInput): Promise<any>
   const entry = input.entry;
 
   if (entry.status === "pending") {
-    await retryWithBackoff(() => input.backend.uploadBlob(entry));
+    if (entry.op !== "delete") {
+      await retryWithBackoff(() => input.backend.uploadBlob(entry));
+    }
+    const opPayload: Record<string, unknown> = {
+      seq: entry.seq,
+      device: input.deviceId,
+      op: entry.op,
+      path: entry.path,
+      fileId: entry.fileId,
+      parentBlobHashes: entry.parentBlobHashes,
+      mtime: entry.mtime || entry.ts,
+      ts: entry.ts
+    };
+    if (entry.newPath) opPayload.newPath = entry.newPath;
+    if (entry.op !== "delete") opPayload.blobHash = entry.blobHash;
     const publishResult = await retryWithBackoff(() =>
-      input.backend.appendOperation({
-        seq: entry.seq,
-        device: input.deviceId,
-        op: entry.op,
-        path: entry.path,
-        newPath: entry.newPath,
-        fileId: entry.fileId,
-        blobHash: entry.blobHash,
-        parentBlobHashes: entry.parentBlobHashes,
-        mtime: entry.mtime || entry.ts,
-        ts: entry.ts
-      })
+      input.backend.appendOperation(opPayload)
     );
     state = markOperationPublished(state, entry.seq, publishResult as Record<string, unknown>);
     await input.stateStore.save(state);

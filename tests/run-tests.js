@@ -4,7 +4,9 @@ const Module = require("module");
 
 // Register obsidian mock so compiled TypeScript modules can be required in tests
 const obsidianMock = {
-  Plugin: class Plugin {},
+  Plugin: class Plugin {
+    addRibbonIcon() { return { addClass() {} }; }
+  },
   PluginSettingTab: class PluginSettingTab { constructor() {} },
   Setting: class Setting {
     constructor() { return new Proxy(this, { get: () => () => this }); }

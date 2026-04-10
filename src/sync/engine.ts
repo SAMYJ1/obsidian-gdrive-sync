@@ -142,7 +142,7 @@ export function computeCompactionFloor(
   if (!minActiveCursor) {
     return snapshotFloor;
   }
-  return Math.min(minActiveCursor, snapshotFloor || minActiveCursor);
+  return Math.min(minActiveCursor, snapshotFloor);
 }
 
 export async function compact(options: {
@@ -229,22 +229,23 @@ export class SyncEngine {
     let state = await this.loadState();
     const reservedState = reserveOperation(state);
     const reservedEntry = reservedState.outbox[reservedState.outbox.length - 1];
-    const blobHash = change.blobHash || computeBlobHashSync(change.content);
     const existingFile = state.files[change.path];
     const parentBlobHash = existingFile && existingFile.blobHash;
     const fileId = change.fileId || (existingFile && existingFile.fileId) || createFileId();
     const nextVersion = change.op === "create" ? 1 : ((existingFile && existingFile.version) || 0) + 1;
+    // Spec: delete ops carry no blobHash
+    const blobHash = change.op === "delete" ? undefined : (change.blobHash || computeBlobHashSync(change.content));
 
     state = bindReservedOperation(reservedState, reservedEntry.seq, {
       device: this.deviceId,
       ts: this.now(),
-      mtime: this.now(),
+      mtime: change.op === "delete" ? undefined : this.now(),
       op: change.op,
       path: change.path,
       fileId,
       blobHash,
       parentBlobHashes: parentBlobHash ? [parentBlobHash] : [],
-      content: change.content
+      content: change.op === "delete" ? undefined : change.content
     });
 
     if (change.op === "delete") {
@@ -380,6 +381,11 @@ export class SyncEngine {
       state = pullResult.state;
       remoteOperations = pullResult.remoteOperations;
 
+      // Transition to merging phase for conflict resolution + local apply
+      if (remoteOperations.length > 0) {
+        onPhaseChange("merging");
+      }
+
       for (const entry of remoteOperations) {
         if (entry.op === "delete") {
           deletedPaths.add(`vault/${entry.path}`);
@@ -447,10 +453,18 @@ export class SyncEngine {
     if (this.runtimeStateStore) {
       this.runtimeStateStore.beginRemoteApply(paths);
     }
+    // Deduplicate ops by (device, seq) pair for idempotency
+    const seen = new Set<string>();
+    const dedupedEntries = (entries || []).filter((entry) => {
+      const key = `${entry.device}:${entry.seq}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
     try {
       let state = await this.loadState();
       if (this.vaultAdapter && typeof this.vaultAdapter.applyRemoteOperation === "function") {
-        for (const entry of entries || []) {
+        for (const entry of dedupedEntries) {
           const hydratedEntry = await this.hydrateRemoteEntry(entry);
           const localFile = state.files[hydratedEntry.path];
           const localRenameFile = hydratedEntry.fileId ? this.findTrackedFileById(state, hydratedEntry.fileId) : null;

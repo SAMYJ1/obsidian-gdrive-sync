@@ -181,6 +181,9 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
         await this.runSyncNow();
       }
     });
+    this.addRibbonIcon("refresh-cw", "Sync now", async () => {
+      await this.runSyncNow();
+    });
     this.registerVaultEvents();
     this.registerForegroundPollingHooks();
     this.startPolling();
@@ -368,9 +371,13 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
   registerForegroundPollingHooks(): void {
     if (typeof document !== "undefined") {
       this.registerDomEvent(document, "visibilitychange", () => {
-        this.startPolling();
-        if (this.settings.pollMode === "foreground" && document.visibilityState !== "hidden") {
-          this.runSyncNow().catch((error: unknown) => new obsidian.Notice(String(error)));
+        if (document.visibilityState === "hidden" && this.settings.pollMode === "foreground") {
+          this.stopPolling();
+        } else {
+          this.startPolling();
+          if (this.settings.pollMode === "foreground" && document.visibilityState !== "hidden") {
+            this.runSyncNow().catch((error: unknown) => new obsidian.Notice(String(error)));
+          }
         }
       });
     }
