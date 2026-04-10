@@ -740,6 +740,11 @@ export class GoogleDriveClient {
   }
 
   async writeManifest(patch: ManifestPatch): Promise<ManifestRecord> {
+    // Spec §2: ETag-based CAS — preserve the ETag from the caller's original read.
+    // The internal readManifest here is to get the latest manifest content to apply
+    // patches against, but we must use the previously-observed ETag for the conditional
+    // write so concurrent modifications trigger HTTP 412.
+    const casETag = this.manifestETag;
     const manifest = await this.readManifest();
     const device = manifest.devices[patch.deviceId] ?? {};
     let opsHead = device.opsHead ?? 0;
@@ -814,7 +819,7 @@ export class GoogleDriveClient {
     manifest.version = (manifest.version ?? 0) + 1;
 
     await this.createOrUpdateFile("manifest.json", JSON.stringify(manifest, null, 2), "application/json", "json", {
-      ifMatch: this.manifestETag ?? undefined
+      ifMatch: casETag ?? undefined
     });
     return manifest;
   }
