@@ -2,6 +2,7 @@ import crypto from "crypto";
 
 import { normalizeSettings } from "../settings";
 import { isIgnoredPath } from "../vault/filter";
+import { computeBlobHash } from "../utils/hash";
 import { computeBlobHashSync, isBinaryPath, mergeRemoteText } from "./merge";
 import { pullRemoteOperations } from "./pull";
 import { pushOutboxEntry } from "./push";
@@ -79,8 +80,26 @@ export async function coldStart(options: {
     const snapshotMetaAfter = await backend.readSnapshotMeta(settings);
     const beforeKey = JSON.stringify(snapshotMetaBefore || {});
     const afterKey = JSON.stringify(snapshotMetaAfter || {});
-    if (beforeKey !== afterKey && attempt < maxAttempts - 1) {
-      continue;
+    if (beforeKey !== afterKey) {
+      if (attempt < maxAttempts - 1) {
+        continue;
+      }
+      // Fallback: pure op-log replay from seq 0 (spec §3)
+      console.warn("obsidian-gdrive-sync: cold start snapshot unstable after 3 attempts, falling back to pure op-log replay");
+      let state = normalizeLocalState(await stateStore.load());
+      state = { ...state, files: {} };
+      await stateStore.save(state);
+      const allOps = await backend.getPendingRemoteOperations({}, settings);
+      const replayHeads = buildTargetHeads(manifest);
+      const replayable = filterOperationsToTargetHeads(allOps, replayHeads);
+      await applyRemoteOperations(replayable);
+      state = normalizeLocalState(await stateStore.load());
+      state = updateCursorVector(state, replayHeads);
+      await stateStore.save(state);
+      if (backend && typeof backend.writeCursor === "function") {
+        await backend.writeCursor(deviceId, replayHeads);
+      }
+      return { snapshotMeta: null, targetHeads: replayHeads, replayedOperations: replayable };
     }
 
     let state = normalizeLocalState(await stateStore.load());
@@ -195,6 +214,8 @@ export class SyncEngine {
   private readonly now: () => number;
   private readonly runtimeStateStore: any;
   private readonly vaultAdapter: any;
+  private readonly notifyUser: ((message: string) => void) | null;
+  private lastSyncHadConflicts = false;
 
   constructor(options: {
     deviceId: string;
@@ -204,6 +225,7 @@ export class SyncEngine {
     now?: () => number;
     runtimeStateStore?: any;
     vaultAdapter?: any;
+    notifyUser?: (message: string) => void;
   }) {
     this.deviceId = options.deviceId;
     this.backend = options.backend;
@@ -212,6 +234,7 @@ export class SyncEngine {
     this.now = options.now ?? defaultNow;
     this.runtimeStateStore = options.runtimeStateStore ?? null;
     this.vaultAdapter = options.vaultAdapter ?? null;
+    this.notifyUser = options.notifyUser ?? null;
   }
 
   async trackLocalChange(change: {
@@ -234,7 +257,7 @@ export class SyncEngine {
     const fileId = change.fileId || (existingFile && existingFile.fileId) || createFileId();
     const nextVersion = change.op === "create" ? 1 : ((existingFile && existingFile.version) || 0) + 1;
     // Spec: delete ops carry no blobHash
-    const blobHash = change.op === "delete" ? undefined : (change.blobHash || computeBlobHashSync(change.content));
+    const blobHash = change.op === "delete" ? undefined : (change.blobHash || await computeBlobHash(change.content));
 
     state = bindReservedOperation(reservedState, reservedEntry.seq, {
       device: this.deviceId,
@@ -277,7 +300,7 @@ export class SyncEngine {
     const reservedState = reserveOperation(state);
     const reservedEntry = reservedState.outbox[reservedState.outbox.length - 1];
     const fileId = (existingFile && existingFile.fileId) || createFileId();
-    const blobHash = computeBlobHashSync(content);
+    const blobHash = await computeBlobHash(content);
     const parentBlobHash = existingFile && existingFile.blobHash;
 
     state = bindReservedOperation(reservedState, reservedEntry.seq, {
@@ -381,8 +404,10 @@ export class SyncEngine {
       state = pullResult.state;
       remoteOperations = pullResult.remoteOperations;
 
-      // Transition to merging phase for conflict resolution + local apply
-      if (remoteOperations.length > 0) {
+      // Transition to merging phase only if conflicts were detected (spec §7 state machine)
+      // Note: conflicts are already resolved during applyRemoteOperations in the pull phase;
+      // the merging phase is entered reactively when conflicts were found
+      if (this.lastSyncHadConflicts) {
         onPhaseChange("merging");
       }
 
@@ -449,6 +474,7 @@ export class SyncEngine {
   }
 
   async applyRemoteOperations(entries: any[]): Promise<void> {
+    this.lastSyncHadConflicts = false;
     const paths = (entries || []).map((entry) => entry.newPath || entry.path);
     if (this.runtimeStateStore) {
       this.runtimeStateStore.beginRemoteApply(paths);
@@ -476,6 +502,7 @@ export class SyncEngine {
               localFile.blobHash !== hydratedEntry.parentBlobHashes[0];
 
             if (localChangedFromBase) {
+              this.lastSyncHadConflicts = true;
               const modifyResolution = await this.resolveModifyConflict(state, localFile, hydratedEntry);
               const existingFile = state.files[hydratedEntry.path] || {};
               state = updateTrackedFile(state, {
@@ -495,6 +522,7 @@ export class SyncEngine {
           if (hydratedEntry.op === "delete" && localFile && localFile.blobHash) {
             const remoteParent = hydratedEntry.parentBlobHashes && hydratedEntry.parentBlobHashes[0];
             if (remoteParent && localFile.blobHash !== remoteParent) {
+              this.lastSyncHadConflicts = true;
               await this.resolveDeleteModifyConflict(localFile, hydratedEntry);
               continue;
             }
@@ -506,6 +534,7 @@ export class SyncEngine {
             const localContentChanged = remoteParent && localRenameFile.blobHash && localRenameFile.blobHash !== remoteParent;
             if (localContentChanged) {
               // Content was also modified during rename — apply delete-vs-modify rule at new path
+              this.lastSyncHadConflicts = true;
               await this.resolveDeleteModifyConflict(
                 { ...localRenameFile, path: localRenameFile.renamedTo },
                 { ...hydratedEntry, path: localRenameFile.renamedTo }
@@ -535,6 +564,7 @@ export class SyncEngine {
               });
               continue;
             }
+            this.lastSyncHadConflicts = true;
             await this.resolveRenameConflict(localRenameFile, hydratedEntry);
             continue;
           }
@@ -662,9 +692,34 @@ export class SyncEngine {
     if (isBinaryPath(remoteOp.path)) {
       const ext = remoteOp.path.split(".").pop();
       const baseName = remoteOp.path.slice(0, remoteOp.path.length - ext.length - 1);
-      const conflictPath = `${baseName}.conflict-${remoteOp.device || "unknown"}-${remoteOp.ts || this.now()}.${ext}`;
+      // Spec §3: last-write-wins — newer version by mtime becomes primary
+      const localMtime = localFile.mtime || localFile.updatedAt || 0;
+      const remoteMtime = remoteOp.mtime || remoteOp.ts || 0;
+      const remoteIsNewer = remoteMtime >= localMtime;
+      const conflictDevice = remoteIsNewer ? "local" : (remoteOp.device || "unknown");
+      const conflictTs = remoteIsNewer ? (localMtime || this.now()) : (remoteOp.ts || this.now());
+      const conflictPath = `${baseName}.conflict-${conflictDevice}-${conflictTs}.${ext}`;
       if (this.vaultAdapter && typeof this.vaultAdapter.writeConflictCopy === "function") {
-        await this.vaultAdapter.writeConflictCopy(conflictPath, localFile.content || "");
+        if (remoteIsNewer) {
+          // Remote is newer → remote becomes primary, local becomes conflict copy
+          await this.vaultAdapter.writeConflictCopy(conflictPath, localFile.content || "");
+          await this.vaultAdapter.applyRemoteOperation(remoteOp);
+          return {
+            blobHash: remoteOp.blobHash,
+            content: remoteOp.content,
+            lastModifiedBy: remoteOp.device,
+            updatedAt: remoteOp.ts || this.now()
+          };
+        } else {
+          // Local is newer → local stays as primary, remote becomes conflict copy
+          await this.vaultAdapter.writeConflictCopy(conflictPath, remoteOp.content || "");
+          return {
+            blobHash: localFile.blobHash,
+            content: localFile.content,
+            lastModifiedBy: localFile.lastModifiedBy,
+            updatedAt: localFile.updatedAt || this.now()
+          };
+        }
       }
       await this.vaultAdapter.applyRemoteOperation(remoteOp);
       return {
@@ -683,6 +738,12 @@ export class SyncEngine {
       } catch {
         baseContent = "";
       }
+    } else {
+      // No common ancestor found — falling back to two-way diff (spec §3)
+      console.warn(`obsidian-gdrive-sync: no common ancestor for ${remoteOp.path}, using two-way diff`);
+      if (typeof this.notifyUser === "function") {
+        this.notifyUser(`Merge conflict in ${remoteOp.path}: no common ancestor found, using two-way diff`);
+      }
     }
     const localContent = localFile.content || "";
     let remoteContent = "";
@@ -692,7 +753,7 @@ export class SyncEngine {
       remoteContent = "";
     }
 
-    const result = mergeRemoteText(localContent, baseContent, remoteContent, remoteOp.device || "unknown");
+    const result = await mergeRemoteText(localContent, baseContent, remoteContent, remoteOp.device || "unknown");
     if (this.vaultAdapter && typeof this.vaultAdapter.writeFile === "function") {
       await this.vaultAdapter.writeFile(remoteOp.path, result.merged);
     } else {
@@ -747,7 +808,7 @@ export class SyncEngine {
       } catch {
         remoteContent = "";
       }
-      const result = mergeRemoteText(localContent, baseContent, remoteContent, remoteOp.device || "unknown");
+      const result = await mergeRemoteText(localContent, baseContent, remoteContent, remoteOp.device || "unknown");
       if (this.vaultAdapter && typeof this.vaultAdapter.writeFile === "function") {
         await this.vaultAdapter.writeFile(remoteOp.newPath, result.merged);
       }

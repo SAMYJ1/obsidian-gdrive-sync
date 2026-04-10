@@ -349,8 +349,8 @@ module.exports = (async function() {
     assert.strictEqual(t.appliedOps[0].path, "images/photo.png", "binary conflict: applied op should target the correct file");
     assert.strictEqual(t.conflictCopies.length, 1, "binary conflict: writeConflictCopy should be called once");
     assert(
-      t.conflictCopies[0].path.indexOf(".conflict-device-b-2000.png") !== -1,
-      "binary conflict: conflict copy path should contain .conflict-{device}-{ts}.png, got: " + t.conflictCopies[0].path
+      t.conflictCopies[0].path.indexOf(".conflict-local-1000.png") !== -1,
+      "binary conflict: conflict copy path should contain .conflict-local-{mtime}.png (loser is local), got: " + t.conflictCopies[0].path
     );
     assert.strictEqual(
       t.conflictCopies[0].content,

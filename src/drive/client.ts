@@ -41,6 +41,7 @@ export interface DriveFileRecord {
   mimeType?: string;
   parents?: string[];
   appProperties?: Record<string, string>;
+  createdTime?: string;
 }
 
 export interface ManifestDeviceRecord {
@@ -897,14 +898,33 @@ export class GoogleDriveClient {
     const manifest = await this.readManifest();
     const results: OperationEntry[] = [];
     for (const deviceId of Object.keys(manifest.devices ?? {})) {
+      // Read live log
       const body = await this.readFile(`ops/live/${deviceId}.jsonl`);
-      if (!body) {
-        continue;
+      if (body) {
+        for (const line of body.split("\n").filter(Boolean)) {
+          const entry = JSON.parse(line) as OperationEntry;
+          if (entry.fileId === fileId) {
+            results.push(entry);
+          }
+        }
       }
-      for (const line of body.split("\n").filter(Boolean)) {
-        const entry = JSON.parse(line) as OperationEntry;
-        if (entry.fileId === fileId) {
-          results.push(entry);
+      // Fallback: also check archive logs for ancestry walking (spec §3)
+      const allFiles = await this.listManagedFiles();
+      const archiveFiles = allFiles.filter((f) => {
+        const lp = f.appProperties?.logicalPath;
+        return lp && lp.startsWith(`ops/archive/${deviceId}-`) && lp.endsWith(".jsonl");
+      });
+      for (const archiveFile of archiveFiles) {
+        const archiveBody = await this.readFile(archiveFile.appProperties?.logicalPath || "");
+        if (archiveBody) {
+          for (const line of archiveBody.split("\n").filter(Boolean)) {
+            try {
+              const entry = JSON.parse(line) as OperationEntry;
+              if (entry.fileId === fileId) {
+                results.push(entry);
+              }
+            } catch { /* skip malformed */ }
+          }
         }
       }
     }
@@ -1022,5 +1042,55 @@ export class GoogleDriveClient {
       });
     }
     return vectors;
+  }
+
+  async garbageCollectBlobs(options?: { maxAgeMs?: number }): Promise<{ deletedCount: number }> {
+    const maxAgeMs = options?.maxAgeMs ?? 7 * 24 * 60 * 60 * 1000;
+    const now = this.now();
+    const manifest = await this.readManifest();
+
+    // Collect all referenced blob hashes from manifest files
+    const referencedHashes = new Set<string>();
+    for (const record of Object.values(manifest.files ?? {})) {
+      if ((record as any).blobHash) {
+        referencedHashes.add((record as any).blobHash);
+      }
+    }
+
+    // Collect referenced hashes from all op-logs
+    for (const deviceId of Object.keys(manifest.devices ?? {})) {
+      const body = await this.readFile(`ops/live/${deviceId}.jsonl`);
+      if (body) {
+        for (const line of body.split("\n").filter(Boolean)) {
+          try {
+            const entry = JSON.parse(line);
+            if (entry.blobHash) referencedHashes.add(entry.blobHash);
+            if (entry.parentBlobHashes) {
+              for (const h of entry.parentBlobHashes) referencedHashes.add(h);
+            }
+          } catch { /* skip malformed lines */ }
+        }
+      }
+    }
+
+    // Find and delete unreferenced blobs older than maxAgeMs
+    const allFiles = await this.listManagedFiles();
+    const blobFiles = allFiles.filter((f) => {
+      const lp = f.appProperties?.logicalPath;
+      return lp && lp.startsWith("blobs/");
+    });
+
+    let deletedCount = 0;
+    for (const file of blobFiles) {
+      const blobHash = file.appProperties?.logicalPath?.replace("blobs/", "");
+      if (blobHash && !referencedHashes.has(blobHash)) {
+        const createdTime = file.createdTime ? new Date(file.createdTime).getTime() : 0;
+        if (createdTime && now - createdTime > maxAgeMs) {
+          await this.request("DELETE", `/drive/v3/files/${file.id}`, {});
+          deletedCount++;
+        }
+      }
+    }
+    return { deletedCount };
   }
 }

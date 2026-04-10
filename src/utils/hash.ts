@@ -19,5 +19,5 @@ export async function sha256Hex(input: string | Uint8Array): Promise<string> {
 }
 
 export async function computeBlobHash(input: string | Uint8Array): Promise<string> {
-  return "sha256:" + await sha256Hex(input);
+  return "sha256-" + await sha256Hex(input);
 }

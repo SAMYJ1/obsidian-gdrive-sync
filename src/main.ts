@@ -42,16 +42,25 @@ function createSettingsStore(plugin: any) {
 }
 
 function createLocalStateStore(plugin: any) {
+  const outboxPath = `${plugin.manifest.dir}/outbox.json`;
   return {
     async load() {
-      const data = await loadPluginData(plugin);
-      return normalizeLocalState(data.localState);
+      try {
+        const raw = await plugin.app.vault.adapter.read(outboxPath);
+        return normalizeLocalState(JSON.parse(raw));
+      } catch {
+        // Fallback: migrate from data.json if outbox.json doesn't exist yet
+        const data = await loadPluginData(plugin);
+        if (data.localState) {
+          return normalizeLocalState(data.localState);
+        }
+        return normalizeLocalState({});
+      }
     },
     async save(localState: any) {
-      const data = await loadPluginData(plugin);
-      data.localState = normalizeLocalState(localState);
-      await savePluginData(plugin, data);
-      return data.localState;
+      const normalized = normalizeLocalState(localState);
+      await plugin.app.vault.adapter.write(outboxPath, JSON.stringify(normalized, null, 2));
+      return normalized;
     }
   };
 }
@@ -164,7 +173,8 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
       settingsStore: this.settingsStore,
       stateStore: this.stateStore,
       runtimeStateStore: this.runtimeStateStore,
-      vaultAdapter: this.vaultAdapter
+      vaultAdapter: this.vaultAdapter,
+      notifyUser: (msg: string) => new obsidian.Notice(msg)
     });
 
     this.addSettingTab(new ObsidianGDriveSyncSettingTab(this.app, this));

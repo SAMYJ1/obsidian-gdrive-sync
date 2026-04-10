@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import { merge3 } from "../utils/diff3";
+import { computeBlobHash } from "../utils/hash";
 
 export interface MergeOutcome {
   merged: string;
@@ -15,22 +16,21 @@ export function isBinaryPath(filePath: string): boolean {
 }
 
 export function computeBlobHashSync(content: string): string {
-  // Synchronous hash for inline merge results; uses Node.js crypto (always available in Electron)
-  return `sha256:${crypto.createHash("sha256").update(String(content || "")).digest("hex")}`;
+  return `sha256-${crypto.createHash("sha256").update(String(content || "")).digest("hex")}`;
 }
 
-export function mergeRemoteText(
+export async function mergeRemoteText(
   localContent: string,
   baseContent: string,
   remoteContent: string,
   remoteDevice: string
-): MergeOutcome {
+): Promise<MergeOutcome> {
   const result = merge3(localContent, baseContent, remoteContent, {
     localLabel: "local",
     remoteLabel: `remote (${remoteDevice || "unknown"})`
   });
   return {
     ...result,
-    blobHash: computeBlobHashSync(result.merged)
+    blobHash: await computeBlobHash(result.merged)
   };
 }
