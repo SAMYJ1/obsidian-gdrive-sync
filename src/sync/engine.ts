@@ -373,9 +373,6 @@ export class SyncEngine {
     state = pruneStaleReservedEntries(state);
     await this.stateStore.save(state);
 
-    // Reconciliation pass: detect published-but-uncommitted ops
-    await this.reconcileUncommittedOps();
-
     if (await this.shouldColdStart(state, settings)) {
       await coldStart({
         backend: this.backend,
@@ -438,6 +435,9 @@ export class SyncEngine {
     }
 
     onPhaseChange("pulling");
+
+    // Spec §3: reconciliation pass runs at the start of each pull
+    await this.reconcileUncommittedOps();
     let remoteOperations: any[] = [];
     try {
       const pullResult = await pullRemoteOperations({
@@ -512,6 +512,15 @@ export class SyncEngine {
       await this.maybeCompact(state, settings);
     } catch (compactionError) {
       console.warn("obsidian-gdrive-sync: compaction failed", compactionError);
+    }
+
+    // Spec §3: periodic blob GC runs independently of compaction
+    if (typeof this.backend.garbageCollectBlobs === "function") {
+      try {
+        await this.backend.garbageCollectBlobs();
+      } catch (gcError) {
+        console.warn("obsidian-gdrive-sync: blob GC failed", gcError);
+      }
     }
 
     return {
@@ -1018,15 +1027,6 @@ export class SyncEngine {
       deviceId: this.deviceId,
       floor
     });
-
-    // Spec §3: periodic GC of unreferenced blobs older than 7 days
-    if (typeof this.backend.garbageCollectBlobs === "function") {
-      try {
-        await this.backend.garbageCollectBlobs();
-      } catch (gcError) {
-        console.warn("obsidian-gdrive-sync: blob GC failed", gcError);
-      }
-    }
 
     return compactionResult;
   }
