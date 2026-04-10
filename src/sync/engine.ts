@@ -308,7 +308,8 @@ export class SyncEngine {
     return state;
   }
 
-  async syncNow(): Promise<SyncRunResult> {
+  async syncNow(options?: { onPhaseChange?: (phase: string) => void }): Promise<SyncRunResult> {
+    const onPhaseChange = options?.onPhaseChange ?? (() => {});
     let state = await this.loadState();
     const settings = await this.loadSettings();
     const changedPaths = new Set<string>();
@@ -317,6 +318,9 @@ export class SyncEngine {
 
     state = pruneStaleReservedEntries(state);
     await this.stateStore.save(state);
+
+    // Reconciliation pass: detect published-but-uncommitted ops
+    await this.reconcileUncommittedOps();
 
     if (await this.shouldColdStart(state, settings)) {
       await coldStart({
@@ -330,6 +334,7 @@ export class SyncEngine {
       state = await this.loadState();
     }
 
+    onPhaseChange("pushing");
     for (const entry of state.outbox.slice()) {
       if (entry.status !== "pending" && entry.status !== "published") {
         continue;
@@ -361,6 +366,7 @@ export class SyncEngine {
       }
     }
 
+    onPhaseChange("pulling");
     let remoteOperations: any[] = [];
     try {
       const pullResult = await pullRemoteOperations({
@@ -392,6 +398,7 @@ export class SyncEngine {
       console.warn("obsidian-gdrive-sync: pull failed", pullError);
     }
 
+    onPhaseChange("finalizing");
     state = await this.loadState();
     const changedFiles = [];
     for (const filePath of changedPaths) {
@@ -754,6 +761,44 @@ export class SyncEngine {
 
   async loadState(): Promise<any> {
     return normalizeLocalState(await this.stateStore.load());
+  }
+
+  async reconcileUncommittedOps(): Promise<void> {
+    if (typeof this.backend.readManifest !== "function" ||
+      typeof this.backend.readOperationLog !== "function" ||
+      typeof this.backend.commitManifest !== "function") {
+      return;
+    }
+    try {
+      const manifest = await this.backend.readManifest();
+      const committedHead = manifest.devices?.[this.deviceId]?.opsHead ?? 0;
+      const opLog = await this.backend.readOperationLog(this.deviceId);
+      if (!opLog.length) return;
+      const highestDurableSeq = opLog[opLog.length - 1].seq;
+      if (highestDurableSeq <= committedHead) return;
+      // Published but uncommitted ops found — recommit manifest
+      const uncommitted = opLog.filter((entry: any) => entry.seq > committedHead);
+      console.warn(
+        `obsidian-gdrive-sync: reconciling ${uncommitted.length} uncommitted ops (seq ${committedHead + 1}..${highestDurableSeq})`
+      );
+      await this.backend.commitManifest({
+        deviceId: this.deviceId,
+        files: uncommitted.map((entry: any) => ({
+          path: entry.path,
+          newPath: entry.newPath,
+          op: entry.op,
+          fileId: entry.fileId,
+          blobHash: entry.blobHash,
+          size: typeof entry.content === "string" ? entry.content.length : undefined,
+          mtime: entry.mtime || entry.ts,
+          lastModifiedBy: this.deviceId,
+          updatedAt: entry.ts,
+          seq: entry.seq
+        }))
+      });
+    } catch (error) {
+      console.warn("obsidian-gdrive-sync: reconciliation failed", error);
+    }
   }
 
   findTrackedFileById(state: any, fileId: string): any {

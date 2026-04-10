@@ -718,18 +718,48 @@ export class GoogleDriveClient {
     for (const deviceId of Object.keys(manifest.devices ?? {})) {
       const since = cursorByDevice?.[deviceId] ?? 0;
       const committedHead = manifest.devices[deviceId]?.opsHead ?? 0;
+      if (committedHead <= since) continue;
       const body = await this.readFile(`ops/live/${deviceId}.jsonl`);
-      if (!body) {
-        continue;
+      const liveEntries: OperationEntry[] = [];
+      if (body) {
+        for (const line of body.split("\n").filter(Boolean)) {
+          const entry = JSON.parse(line) as OperationEntry;
+          if (entry.seq > since && entry.seq <= committedHead) {
+            liveEntries.push(entry);
+          }
+        }
       }
+      // Check for gaps: if the live log doesn't contain all expected seqs, try archive
+      const liveMinSeq = liveEntries.length > 0 ? Math.min(...liveEntries.map((e) => e.seq)) : committedHead + 1;
+      if (liveMinSeq > since + 1) {
+        console.warn(`obsidian-gdrive-sync: live log for ${deviceId} missing ops ${since + 1}..${liveMinSeq - 1}, checking archive`);
+        const archiveEntries = await this.readArchiveOps(deviceId, since, liveMinSeq);
+        results.push(...archiveEntries);
+      }
+      results.push(...liveEntries);
+    }
+    return results.sort((left, right) => (left.ts ?? 0) - (right.ts ?? 0));
+  }
+
+  private async readArchiveOps(deviceId: string, sinceSeq: number, beforeSeq: number): Promise<OperationEntry[]> {
+    const files = await this.listManagedFiles();
+    const archiveFiles = files.filter((file) => {
+      const logicalPath = file.appProperties?.logicalPath;
+      return Boolean(logicalPath && logicalPath.startsWith(`ops/archive/${deviceId}-`));
+    });
+    const results: OperationEntry[] = [];
+    for (const file of archiveFiles) {
+      const logicalPath = file.appProperties?.logicalPath ?? "";
+      const body = await this.readFile(logicalPath);
+      if (!body) continue;
       for (const line of body.split("\n").filter(Boolean)) {
         const entry = JSON.parse(line) as OperationEntry;
-        if (entry.seq > since && entry.seq <= committedHead) {
+        if (entry.seq > sinceSeq && entry.seq < beforeSeq) {
           results.push(entry);
         }
       }
     }
-    return results.sort((left, right) => (left.ts ?? 0) - (right.ts ?? 0));
+    return results;
   }
 
   async fetchBlob(blobHash: string): Promise<string> {

@@ -9,6 +9,7 @@ export interface PluginSettings {
   remoteApplyCooldownMs: number;
   ignorePatterns: string[];
   pushDebounceMs: number;
+  pushWindowMs: number;
   pollIntervalSeconds: number;
   pollMode: PollMode;
   enableAutoSync: boolean;
@@ -27,6 +28,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   remoteApplyCooldownMs: 2000,
   ignorePatterns: [],
   pushDebounceMs: 5000,
+  pushWindowMs: 120000,
   pollIntervalSeconds: 30,
   pollMode: "foreground",
   enableAutoSync: true,
@@ -58,6 +60,9 @@ export function normalizeSettings(input?: Partial<PluginSettings> | null): Plugi
   }
   if (!Number.isInteger(merged.pushDebounceMs) || merged.pushDebounceMs < 0) {
     merged.pushDebounceMs = DEFAULT_SETTINGS.pushDebounceMs;
+  }
+  if (!Number.isInteger(merged.pushWindowMs) || merged.pushWindowMs < 0) {
+    merged.pushWindowMs = DEFAULT_SETTINGS.pushWindowMs;
   }
   if (!Number.isInteger(merged.pollIntervalSeconds) || merged.pollIntervalSeconds < 0) {
     merged.pollIntervalSeconds = DEFAULT_SETTINGS.pollIntervalSeconds;
@@ -126,6 +131,19 @@ export class ObsidianGDriveSyncSettingTab extends obsidian.PluginSettingTab {
           .setValue(String(this.plugin.settings.pushDebounceMs))
           .onChange(async (value: string) => {
             this.plugin.settings.pushDebounceMs = parseInt(value, 10);
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new obsidian.Setting(containerEl)
+      .setName("Push window (ms)")
+      .setDesc("Maximum wait time before auto-pushing batched changes.")
+      .addText((text: any) => {
+        text
+          .setPlaceholder("120000")
+          .setValue(String(this.plugin.settings.pushWindowMs))
+          .onChange(async (value: string) => {
+            this.plugin.settings.pushWindowMs = parseInt(value, 10);
             await this.plugin.saveSettings();
           });
       });

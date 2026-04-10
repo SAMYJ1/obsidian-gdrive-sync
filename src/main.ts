@@ -114,8 +114,10 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
   vaultAdapter: any;
   syncEngine: any;
   debouncedSyncNow: any;
+  pushWindowHandle: any;
   pollIntervalHandle: any;
-  syncInFlight = false;
+  syncPhase: "idle" | "pushing" | "pulling" | "merging" | "finalizing" = "idle";
+  pendingSyncTrigger = false;
 
   async onload(): Promise<void> {
     const rawData = await loadPluginData(this);
@@ -189,6 +191,7 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
 
   async onunload(): Promise<void> {
     this.stopPolling();
+    this.clearPushWindow();
     await this.saveSettings();
   }
 
@@ -230,12 +233,29 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
   scheduleSync(): void {
     if (!this.debouncedSyncNow) {
       this.debouncedSyncNow = obsidian.debounce(
-        () => this.runSyncNow().catch((error: unknown) => new obsidian.Notice(String(error))),
+        () => {
+          this.clearPushWindow();
+          this.runSyncNow().catch((error: unknown) => new obsidian.Notice(String(error)));
+        },
         this.settings.pushDebounceMs,
         true
       );
     }
     this.debouncedSyncNow();
+    // Push window: guarantee sync fires within pushWindowMs even if debounce keeps resetting
+    if (!this.pushWindowHandle && this.settings.pushWindowMs > 0) {
+      this.pushWindowHandle = window.setTimeout(() => {
+        this.pushWindowHandle = null;
+        this.runSyncNow().catch((error: unknown) => new obsidian.Notice(String(error)));
+      }, this.settings.pushWindowMs);
+    }
+  }
+
+  clearPushWindow(): void {
+    if (this.pushWindowHandle) {
+      window.clearTimeout(this.pushWindowHandle);
+      this.pushWindowHandle = null;
+    }
   }
 
   startPolling(): void {
@@ -256,7 +276,7 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
   }
 
   async pollForChanges(): Promise<void> {
-    if (this.syncInFlight) return;
+    if (this.syncPhase !== "idle") return;
     try {
       let state = await this.stateStore.load();
       if (!state.changesPageToken) {
@@ -291,14 +311,25 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
   }
 
   async runSyncNow(): Promise<void> {
-    if (this.syncInFlight) {
+    if (this.syncPhase !== "idle") {
+      this.pendingSyncTrigger = true;
       return;
     }
-    this.syncInFlight = true;
+    this.syncPhase = "pushing";
     try {
-      await this.syncEngine.syncNow();
+      await this.syncEngine.syncNow({
+        onPhaseChange: (phase: string) => {
+          if (phase === "pushing" || phase === "pulling" || phase === "merging" || phase === "finalizing") {
+            this.syncPhase = phase;
+          }
+        }
+      });
     } finally {
-      this.syncInFlight = false;
+      this.syncPhase = "idle";
+      if (this.pendingSyncTrigger) {
+        this.pendingSyncTrigger = false;
+        this.runSyncNow().catch((error: unknown) => new obsidian.Notice(String(error)));
+      }
     }
   }
 
