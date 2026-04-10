@@ -251,6 +251,8 @@ export class SyncEngine {
 
     let state = await this.loadState();
     const reservedState = reserveOperation(state);
+    // Spec §3: Step 1 — persist reserved entry durably before binding
+    await this.stateStore.save(reservedState);
     const reservedEntry = reservedState.outbox[reservedState.outbox.length - 1];
     const existingFile = state.files[change.path];
     const parentBlobHash = existingFile && existingFile.blobHash;
@@ -268,7 +270,8 @@ export class SyncEngine {
       fileId,
       blobHash,
       parentBlobHashes: parentBlobHash ? [parentBlobHash] : [],
-      content: change.op === "delete" ? undefined : change.content
+      content: change.op === "delete" ? undefined : change.content,
+      version: nextVersion
     });
 
     if (change.op === "delete") {
@@ -298,10 +301,13 @@ export class SyncEngine {
     let state = await this.loadState();
     const existingFile = state.files[oldPath];
     const reservedState = reserveOperation(state);
+    // Spec §3: Step 1 — persist reserved entry durably before binding
+    await this.stateStore.save(reservedState);
     const reservedEntry = reservedState.outbox[reservedState.outbox.length - 1];
     const fileId = (existingFile && existingFile.fileId) || createFileId();
     const blobHash = await computeBlobHash(content);
     const parentBlobHash = existingFile && existingFile.blobHash;
+    const nextVersion = ((existingFile && existingFile.version) || 0) + 1;
 
     state = bindReservedOperation(reservedState, reservedEntry.seq, {
       device: this.deviceId,
@@ -313,7 +319,8 @@ export class SyncEngine {
       fileId,
       blobHash,
       parentBlobHashes: parentBlobHash ? [parentBlobHash] : [],
-      content
+      content,
+      version: nextVersion
     });
     state = removeTrackedFile(state, oldPath);
     state = updateTrackedFile(state, {
@@ -359,6 +366,7 @@ export class SyncEngine {
     }
 
     onPhaseChange("pushing");
+    let pushHadErrors = false;
     for (const entry of state.outbox.slice()) {
       if (entry.status !== "pending" && entry.status !== "published") {
         continue;
@@ -387,7 +395,15 @@ export class SyncEngine {
         }
       } catch (pushError) {
         console.warn(`obsidian-gdrive-sync: push failed for entry seq=${entry.seq}`, pushError);
+        pushHadErrors = true;
       }
+    }
+
+    // Spec §7 state machine: PUSHING → FINALIZING on error (skip pull/merge)
+    if (pushHadErrors) {
+      onPhaseChange("finalizing");
+      await this.stateStore.save(state);
+      return { state, remoteOperations: [] };
     }
 
     onPhaseChange("pulling");
@@ -937,11 +953,22 @@ export class SyncEngine {
     if (!floor || floor <= 0) {
       return null;
     }
-    return compact({
+    const compactionResult = await compact({
       backend: this.backend,
       deviceId: this.deviceId,
       floor
     });
+
+    // Spec §3: periodic GC of unreferenced blobs older than 7 days
+    if (typeof this.backend.garbageCollectBlobs === "function") {
+      try {
+        await this.backend.garbageCollectBlobs();
+      } catch (gcError) {
+        console.warn("obsidian-gdrive-sync: blob GC failed", gcError);
+      }
+    }
+
+    return compactionResult;
   }
 
   async shouldColdStart(state: any, settings: any): Promise<boolean> {
