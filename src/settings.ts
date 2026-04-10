@@ -123,27 +123,27 @@ export class ObsidianGDriveSyncSettingTab extends obsidian.PluginSettingTab {
       });
 
     new obsidian.Setting(containerEl)
-      .setName("Push debounce (ms)")
+      .setName("Push debounce (seconds)")
       .setDesc("Delay before automatically syncing local edits.")
       .addText((text: any) => {
         text
-          .setPlaceholder("5000")
-          .setValue(String(this.plugin.settings.pushDebounceMs))
+          .setPlaceholder("5")
+          .setValue(String(this.plugin.settings.pushDebounceMs / 1000))
           .onChange(async (value: string) => {
-            this.plugin.settings.pushDebounceMs = parseInt(value, 10);
+            this.plugin.settings.pushDebounceMs = Math.round(parseFloat(value) * 1000);
             await this.plugin.saveSettings();
           });
       });
 
     new obsidian.Setting(containerEl)
-      .setName("Push window (ms)")
+      .setName("Push window (seconds)")
       .setDesc("Maximum wait time before auto-pushing batched changes.")
       .addText((text: any) => {
         text
-          .setPlaceholder("120000")
-          .setValue(String(this.plugin.settings.pushWindowMs))
+          .setPlaceholder("120")
+          .setValue(String(this.plugin.settings.pushWindowMs / 1000))
           .onChange(async (value: string) => {
-            this.plugin.settings.pushWindowMs = parseInt(value, 10);
+            this.plugin.settings.pushWindowMs = Math.round(parseFloat(value) * 1000);
             await this.plugin.saveSettings();
           });
       });

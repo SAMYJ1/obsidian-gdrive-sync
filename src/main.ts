@@ -118,6 +118,7 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
   pollIntervalHandle: any;
   syncPhase: "idle" | "pushing" | "pulling" | "merging" | "finalizing" = "idle";
   pendingSyncTrigger = false;
+  statusBarEl: any;
 
   async onload(): Promise<void> {
     const rawData = await loadPluginData(this);
@@ -184,6 +185,8 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
     this.addRibbonIcon("refresh-cw", "Sync now", async () => {
       await this.runSyncNow();
     });
+    this.statusBarEl = this.addStatusBarItem();
+    this.statusBarEl.setText("GDrive: idle");
     this.registerVaultEvents();
     this.registerForegroundPollingHooks();
     this.startPolling();
@@ -313,22 +316,37 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
     }
   }
 
+  private updateStatusBar(): void {
+    if (!this.statusBarEl) return;
+    const labels: Record<string, string> = {
+      idle: "GDrive: idle",
+      pushing: "GDrive: pushing ↑",
+      pulling: "GDrive: pulling ↓",
+      merging: "GDrive: merging ⇄",
+      finalizing: "GDrive: finalizing…"
+    };
+    this.statusBarEl.setText(labels[this.syncPhase] || `GDrive: ${this.syncPhase}`);
+  }
+
   async runSyncNow(): Promise<void> {
     if (this.syncPhase !== "idle") {
       this.pendingSyncTrigger = true;
       return;
     }
     this.syncPhase = "pushing";
+    this.updateStatusBar();
     try {
       await this.syncEngine.syncNow({
         onPhaseChange: (phase: string) => {
           if (phase === "pushing" || phase === "pulling" || phase === "merging" || phase === "finalizing") {
             this.syncPhase = phase;
+            this.updateStatusBar();
           }
         }
       });
     } finally {
       this.syncPhase = "idle";
+      this.updateStatusBar();
       if (this.pendingSyncTrigger) {
         this.pendingSyncTrigger = false;
         this.runSyncNow().catch((error: unknown) => new obsidian.Notice(String(error)));

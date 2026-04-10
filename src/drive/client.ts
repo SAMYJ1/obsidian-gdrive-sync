@@ -77,6 +77,7 @@ export interface ManifestPatchFile {
   lastModifiedBy?: string;
   updatedAt?: number;
   version?: number;
+  expectedVersion?: number;
   seq?: number;
 }
 
@@ -206,18 +207,23 @@ export class GoogleDriveClient {
       body?: string | Buffer;
     }
   ): Promise<DriveResponse> {
-    const accessToken = await this.getAccessToken();
-    const headers = {
-      ...(options?.headers ?? {}),
-      Authorization: `Bearer ${accessToken}`
-    };
-    await this.rateLimiter.acquire(1);
-    const response = await this.fetchImpl(`${this.baseUrl}${resourcePath}${toQueryString(options?.query)}`, {
-      method,
-      headers,
-      body: options?.body
-    });
-    if (!response.ok) {
+    const maxAttempts = 3;
+    let lastError: any;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const accessToken = await this.getAccessToken();
+      const headers = {
+        ...(options?.headers ?? {}),
+        Authorization: `Bearer ${accessToken}`
+      };
+      await this.rateLimiter.acquire(1);
+      const response = await this.fetchImpl(`${this.baseUrl}${resourcePath}${toQueryString(options?.query)}`, {
+        method,
+        headers,
+        body: options?.body
+      });
+      if (response.ok) {
+        return response;
+      }
       const text = await response.text();
       const error = new Error(`Google Drive request failed: ${method} ${resourcePath} ${text}`) as Error & {
         status?: number;
@@ -228,9 +234,16 @@ export class GoogleDriveClient {
       if (retryAfter != null) {
         error.retryAfter = Number(retryAfter);
       }
-      throw error;
+      lastError = error;
+      // Retry on transient failures (429 rate limit, 5xx server errors)
+      const isRetryable = response.status === 429 || (response.status >= 500 && response.status < 600);
+      if (!isRetryable || attempt >= maxAttempts) {
+        throw error;
+      }
+      const delay = error.retryAfter ? error.retryAfter * 1000 : 1000 * Math.pow(2, attempt - 1);
+      await new Promise((resolve) => setTimeout(resolve, delay));
     }
-    return response;
+    throw lastError;
   }
 
   async requestJson(
@@ -250,6 +263,19 @@ export class GoogleDriveClient {
     requests: Array<{ method: string; path: string; body?: string }>
   ): Promise<Array<{ status: number; body: any }>> {
     if (requests.length === 0) return [];
+    // Chunk into batches of 100 per Google Drive API limit
+    const results: Array<{ status: number; body: any }> = [];
+    for (let i = 0; i < requests.length; i += 100) {
+      const chunk = requests.slice(i, i + 100);
+      const chunkResults = await this.sendBatch(chunk);
+      results.push(...chunkResults);
+    }
+    return results;
+  }
+
+  private async sendBatch(
+    requests: Array<{ method: string; path: string; body?: string }>
+  ): Promise<Array<{ status: number; body: any }>> {
     const accessToken = await this.getAccessToken();
     const boundary = `batch_${Date.now()}_${Math.random().toString(36).slice(2)}`;
     const parts: string[] = [];
@@ -526,23 +552,44 @@ export class GoogleDriveClient {
       throw new Error("Missing resumable upload session URL");
     }
 
-    await this.rateLimiter.acquire(1);
-    const uploadResponse = await this.fetchImpl(uploadUrl, {
-      method: "PUT",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": mimeType,
-        "Content-Length": String(contentBuffer.length)
-      },
-      body: contentBuffer
-    });
-    if (!uploadResponse.ok) {
-      const text = await uploadResponse.text();
-      const error = new Error(`Google Drive resumable upload failed: ${text}`) as Error & { status?: number };
-      error.status = uploadResponse.status;
-      throw error;
+    // Chunked upload: 256KB chunks per Google's resumable upload protocol
+    const chunkSize = 256 * 1024;
+    const totalSize = contentBuffer.length;
+    let offset = 0;
+    while (offset < totalSize) {
+      const end = Math.min(offset + chunkSize, totalSize);
+      const chunk = contentBuffer.slice(offset, end);
+      const isLastChunk = end === totalSize;
+      await this.rateLimiter.acquire(1);
+      const uploadResponse = await this.fetchImpl(uploadUrl, {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": mimeType,
+          "Content-Length": String(chunk.length),
+          "Content-Range": `bytes ${offset}-${end - 1}/${totalSize}`
+        },
+        body: chunk
+      });
+      if (isLastChunk) {
+        if (!uploadResponse.ok) {
+          const text = await uploadResponse.text();
+          const error = new Error(`Google Drive resumable upload failed: ${text}`) as Error & { status?: number };
+          error.status = uploadResponse.status;
+          throw error;
+        }
+        return uploadResponse.status === 204 ? {} : uploadResponse.json();
+      }
+      // For non-final chunks, Google responds with 308 Resume Incomplete
+      if (uploadResponse.status !== 308 && !uploadResponse.ok) {
+        const text = await uploadResponse.text();
+        const error = new Error(`Google Drive resumable upload chunk failed: ${text}`) as Error & { status?: number };
+        error.status = uploadResponse.status;
+        throw error;
+      }
+      offset = end;
     }
-    return uploadResponse.status === 204 ? {} : uploadResponse.json();
+    return {};
   }
 
   async writeFile(logicalPath: string, content: string | Uint8Array | Buffer): Promise<any> {
@@ -603,15 +650,20 @@ export class GoogleDriveClient {
 
   async deletePath(logicalPath: string): Promise<void> {
     const files = await this.listManagedFiles();
-    for (const file of files) {
+    const toDelete = files.filter((file) => {
       const candidatePath = file.appProperties?.logicalPath;
-      if (!candidatePath) {
-        continue;
-      }
-      if (candidatePath === logicalPath || candidatePath.startsWith(`${logicalPath}/`)) {
+      return candidatePath && (candidatePath === logicalPath || candidatePath.startsWith(`${logicalPath}/`));
+    });
+    // Concurrent deletes (up to 5 parallel)
+    const concurrency = 5;
+    let idx = 0;
+    const worker = async () => {
+      while (idx < toDelete.length) {
+        const file = toDelete[idx++];
         await this.request("DELETE", `/drive/v3/files/${file.id}`, {});
       }
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(concurrency, toDelete.length) }, () => worker()));
   }
 
   async listGenerationIds(): Promise<string[]> {
@@ -704,6 +756,21 @@ export class GoogleDriveClient {
     }
 
     for (const file of patch.files ?? []) {
+      // Version-based optimistic lock: if expectedVersion is provided and the
+      // manifest has already advanced past it, signal a conflict (spec §2)
+      if (typeof file.expectedVersion === "number" && file.op !== "delete") {
+        const currentRecord = manifest.files[file.path];
+        if (currentRecord && typeof currentRecord.version === "number" &&
+            currentRecord.version > file.expectedVersion) {
+          const error = new Error(
+            `Version conflict on ${file.path}: expected ${file.expectedVersion}, manifest has ${currentRecord.version}`
+          ) as Error & { status?: number; versionConflict?: boolean };
+          error.status = 409;
+          error.versionConflict = true;
+          throw error;
+        }
+      }
+
       if (file.op === "delete") {
         delete manifest.files[file.path];
       } else if (file.op === "rename" && file.newPath) {

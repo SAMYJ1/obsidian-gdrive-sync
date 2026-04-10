@@ -6,6 +6,7 @@ const Module = require("module");
 const obsidianMock = {
   Plugin: class Plugin {
     addRibbonIcon() { return { addClass() {} }; }
+    addStatusBarItem() { return { setText() {} }; }
   },
   PluginSettingTab: class PluginSettingTab { constructor() {} },
   Setting: class Setting {

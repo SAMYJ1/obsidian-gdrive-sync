@@ -232,3 +232,22 @@ export async function startOAuthFlow(options: OAuthFlowOptions): Promise<{
     }
   }
 }
+
+export async function revokeToken(options: {
+  fetchImpl: FetchLike;
+  token: string;
+}): Promise<void> {
+  const { fetchImpl, token } = options;
+  if (!token) return;
+  try {
+    await fetchImpl(
+      `https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(token)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" }
+      }
+    );
+  } catch {
+    // Best-effort revocation — failure is non-fatal
+  }
+}

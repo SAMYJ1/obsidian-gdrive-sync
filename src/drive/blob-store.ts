@@ -18,6 +18,11 @@ export class DriveBlobStore {
   }
 
   async fetchBlob(blobHash: string): Promise<string> {
-    return this.driveClient.fetchBlob(blobHash);
+    const content = await this.driveClient.fetchBlob(blobHash);
+    const actualHash = await computeBlobHash(content);
+    if (actualHash !== blobHash) {
+      throw new Error(`Blob integrity check failed: expected ${blobHash}, got ${actualHash}`);
+    }
+    return content;
   }
 }

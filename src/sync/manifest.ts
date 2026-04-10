@@ -16,6 +16,10 @@ export async function commitManifestPatch(input: CommitManifestPatchInput): Prom
     seq: input.entry.seq
   };
   if (input.entry.newPath) patch.newPath = input.entry.newPath;
+  // Spec §2: version-based optimistic lock — pass expected version for conflict detection
+  if (typeof input.entry.version === "number" && input.entry.op !== "create") {
+    patch.expectedVersion = input.entry.version - 1;
+  }
   // Spec: delete ops carry no blobHash, size, or mtime
   if (input.entry.op !== "delete") {
     patch.blobHash = input.entry.blobHash;
