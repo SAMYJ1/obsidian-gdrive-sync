@@ -28,11 +28,13 @@ export async function pushOutboxEntry(input: PushOutboxEntryInput): Promise<any>
       path: entry.path,
       fileId: entry.fileId,
       parentBlobHashes: entry.parentBlobHashes,
-      mtime: entry.mtime || entry.ts,
       ts: entry.ts
     };
     if (entry.newPath) opPayload.newPath = entry.newPath;
-    if (entry.op !== "delete") opPayload.blobHash = entry.blobHash;
+    if (entry.op !== "delete") {
+      opPayload.blobHash = entry.blobHash;
+      opPayload.mtime = entry.mtime || entry.ts;
+    }
     const publishResult = await retryWithBackoff(() =>
       input.backend.appendOperation(opPayload)
     );
