@@ -16,16 +16,21 @@ export async function pullRemoteOperations(input: PullRemoteOperationsInput): Pr
   state: any;
   remoteOperations: any[];
 }> {
-  const remoteOperations = await input.backend.getPendingRemoteOperations(
+  const allOperations = await input.backend.getPendingRemoteOperations(
     input.state.cursorByDevice,
     input.settings
   );
+  // Filter out ops from our own device — they were applied locally when created.
+  // Re-applying them would trigger vault events and create duplicate outbox entries.
+  const remoteOperations = allOperations.filter(
+    (op: any) => op.device !== input.deviceId
+  );
   await input.applyRemoteOperations(remoteOperations);
 
-  // Spec §3: advance cursors only to the ops actually applied, not to latest remote heads.
-  // Deriving heads from fetched ops prevents skipping ops that arrive during pull.
+  // Spec §3: advance cursors for ALL fetched ops (including own device) to prevent re-fetching.
+  // Only remote ops are applied to the vault, but all cursors must advance.
   const appliedHeads: Record<string, number> = { ...(input.state.cursorByDevice || {}) };
-  for (const op of remoteOperations) {
+  for (const op of allOperations) {
     if (op.device && typeof op.seq === "number") {
       appliedHeads[op.device] = Math.max(appliedHeads[op.device] || 0, op.seq);
     }
@@ -34,7 +39,18 @@ export async function pullRemoteOperations(input: PullRemoteOperationsInput): Pr
   const freshState = await input.stateStore.load();
   let state = updateCursorVector(freshState, appliedHeads);
   await input.stateStore.save(state);
-  await input.backend.writeCursor(input.deviceId, state.cursorByDevice);
+
+  // Only write cursor to Drive when it actually changed to avoid creating
+  // unnecessary Drive changes that trigger the poll loop.
+  const oldCursor = input.state.cursorByDevice || {};
+  const newCursor = state.cursorByDevice || {};
+  const cursorChanged = Object.keys(appliedHeads).some(
+    (device) => (newCursor[device] ?? 0) !== (oldCursor[device] ?? 0)
+  );
+  if (cursorChanged) {
+    await input.backend.writeCursor(input.deviceId, state.cursorByDevice);
+  }
+
   return {
     state,
     remoteOperations

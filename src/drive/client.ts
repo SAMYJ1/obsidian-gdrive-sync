@@ -482,7 +482,13 @@ export class GoogleDriveClient {
     const fileName = logicalPath.split("/").pop() ?? logicalPath;
     const parentPath = logicalPath.split("/").slice(0, -1).join("/");
     const parentId = parentPath ? await this.ensureFolder(parentPath) : (await this.ensureVaultFolder()).id;
-    const existing = await this.findByLogicalPath(logicalPath);
+    // For manifest.json, use cached file ID to avoid unreliable appProperties search
+    let existing: DriveFileRecord | null;
+    if (logicalPath === "manifest.json" && this.manifestFileId) {
+      existing = { id: this.manifestFileId, name: "manifest.json" } as DriveFileRecord;
+    } else {
+      existing = await this.findByLogicalPath(logicalPath);
+    }
     const contentBuffer = this.toContentBuffer(content);
     if (contentBuffer.length > this.resumableUploadThresholdBytes) {
       return this.createOrUpdateFileResumable(logicalPath, contentBuffer, mimeType, kind, {
@@ -787,8 +793,43 @@ export class GoogleDriveClient {
   }
 
   async readManifest(): Promise<ManifestRecord> {
+    // Try cached file ID first (avoids unreliable appProperties search)
+    if (this.manifestFileId) {
+      try {
+        const response = await this.request("GET", `/drive/v3/files/${this.manifestFileId}`, {
+          query: { alt: "media" }
+        });
+        this.manifestETag = headerLookup(response, "etag");
+        const body = await response.text();
+        return JSON.parse(body) as ManifestRecord;
+      } catch (error: any) {
+        if (error?.status === 404 || error?.status === 410) {
+          this.manifestFileId = null;
+          this.manifestETag = null;
+        } else {
+          throw error;
+        }
+      }
+    }
+
+    // Search by appProperties (may fail for files with retroactively added properties)
     const existing = await this.findByLogicalPath("manifest.json");
     if (!existing) {
+      // Fallback: search by name in vault folder
+      const vaultRoot = await this.ensureVaultFolder();
+      const byName = await this.listFiles(
+        `name='manifest.json' and '${vaultRoot.id}' in parents and trashed=false`
+      );
+      const fallback = byName.find(f => f.appProperties?.logicalPath?.endsWith("/manifest.json"));
+      if (fallback) {
+        this.manifestFileId = fallback.id;
+        const response = await this.request("GET", `/drive/v3/files/${fallback.id}`, {
+          query: { alt: "media" }
+        });
+        this.manifestETag = headerLookup(response, "etag");
+        const body = await response.text();
+        return JSON.parse(body) as ManifestRecord;
+      }
       this.manifestETag = null;
       this.manifestFileId = null;
       return { version: 2, devices: {}, files: {} };

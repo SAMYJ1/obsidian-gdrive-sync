@@ -263,6 +263,7 @@ export class SyncEngine {
   private readonly vaultAdapter: any;
   private readonly notifyUser: ((message: string) => void) | null;
   private lastSyncHadConflicts = false;
+  private fullSnapshotNeeded = true;
 
   constructor(options: {
     deviceId: string;
@@ -410,6 +411,16 @@ export class SyncEngine {
       state = await this.loadState();
     }
 
+    // Dedup outbox: remove pending "create" entries that are clearly duplicates from the
+    // pull feedback loop. We identify duplicates by checking if the manifest on Drive already
+    // has the file at a version >= the entry's version (meaning it was already pushed).
+    // Simple local-only check is insufficient because trackLocalChange sets both tracked.version
+    // and entry.version to the same value, making new files indistinguishable from duplicates.
+    // Instead, only dedup entries whose status is "pending" and where the file is already
+    // committed (i.e. not pending) in a PRIOR committed entry in the outbox.
+    // NOTE: The primary fix is cursor advancement + pull filter. This dedup is removed
+    // as it was incorrectly filtering out new file entries.
+
     onPhaseChange("pushing");
     let pushHadErrors = false;
     let pushHadVersionConflict = false;
@@ -459,6 +470,21 @@ export class SyncEngine {
             break;
           }
         }
+      }
+    }
+
+    // Advance cursorByDevice for own device after push so the pull phase
+    // doesn't re-fetch ops we just committed (prevents feedback loop).
+    if (typeof this.backend.readManifest === "function") {
+      try {
+        const postPushManifest = await this.backend.readManifest();
+        const ownOpsHead = postPushManifest?.devices?.[this.deviceId]?.opsHead;
+        if (typeof ownOpsHead === "number" && ownOpsHead > (state.cursorByDevice?.[this.deviceId] ?? 0)) {
+          state = updateCursorVector(state, { [this.deviceId]: ownOpsHead });
+          await this.stateStore.save(state);
+        }
+      } catch (cursorError) {
+        console.warn("obsidian-gdrive-sync: failed to advance own cursor after push", cursorError);
       }
     }
 
@@ -515,35 +541,56 @@ export class SyncEngine {
 
     onPhaseChange("finalizing");
     state = await this.loadState();
-    const changedFiles = [];
+    const changedFiles: Array<{ path: string; content: string | Uint8Array }> = [];
+
+    // On first finalize after startup, ensure all tracked files are in the snapshot.
+    // Incremental publishes only cover files changed in this cycle; if a previous
+    // session was interrupted, the vault mirror on Drive may be incomplete.
+    if (this.fullSnapshotNeeded && Object.keys(state.files || {}).length > 0) {
+      for (const filePath of Object.keys(state.files || {})) {
+        changedPaths.add(filePath);
+      }
+      this.fullSnapshotNeeded = false;
+    }
+
     for (const filePath of changedPaths) {
       if (state.files[filePath]) {
-        const content = await this.readTrackedFileContent(state.files[filePath], filePath);
-        changedFiles.push({
-          path: `vault/${filePath}`,
-          content
-        });
+        try {
+          const content = await this.readTrackedFileContent(state.files[filePath], filePath);
+          changedFiles.push({
+            path: `vault/${filePath}`,
+            content
+          });
+        } catch (readError) {
+          console.warn(`obsidian-gdrive-sync: failed to read ${filePath} for snapshot`, readError);
+        }
       }
     }
 
-    try {
-      const previousSnapshotMeta = settings.snapshotPublishMode === "generations" &&
-        typeof this.backend.readSnapshotMeta === "function"
-        ? await this.backend.readSnapshotMeta(settings)
-        : null;
-      await this.backend.publishSnapshot({
-        snapshotPublishMode: settings.snapshotPublishMode,
-        nextGenerationId: `gen-${this.now()}`,
-        previousGenerationId: previousSnapshotMeta && previousSnapshotMeta.generationId,
-        snapshotSeqs: state.cursorByDevice,
-        previousFiles: Object.keys(state.files || {}).map((filePath: string) => `vault/${filePath}`),
-        changedFiles,
-        deletedFiles: Array.from(deletedPaths),
-        renamedFiles,
-        files: changedFiles
-      });
-    } catch (snapshotError) {
-      console.warn("obsidian-gdrive-sync: snapshot publish failed", snapshotError);
+    // Only publish snapshot when there are actual changes to publish.
+    // Writing _snapshot_meta.json on every sync creates a Drive change that
+    // triggers the poll, causing an infinite sync loop.
+    const hasSnapshotChanges = changedFiles.length > 0 || deletedPaths.size > 0 || renamedFiles.length > 0;
+    if (hasSnapshotChanges) {
+      try {
+        const previousSnapshotMeta = settings.snapshotPublishMode === "generations" &&
+          typeof this.backend.readSnapshotMeta === "function"
+          ? await this.backend.readSnapshotMeta(settings)
+          : null;
+        await this.backend.publishSnapshot({
+          snapshotPublishMode: settings.snapshotPublishMode,
+          nextGenerationId: `gen-${this.now()}`,
+          previousGenerationId: previousSnapshotMeta && previousSnapshotMeta.generationId,
+          snapshotSeqs: state.cursorByDevice,
+          previousFiles: Object.keys(state.files || {}).map((filePath: string) => `vault/${filePath}`),
+          changedFiles,
+          deletedFiles: Array.from(deletedPaths),
+          renamedFiles,
+          files: changedFiles
+        });
+      } catch (snapshotError) {
+        console.warn("obsidian-gdrive-sync: snapshot publish failed", snapshotError);
+      }
     }
 
     try {
@@ -580,11 +627,10 @@ export class SyncEngine {
     }
     try {
       const manifest = await this.backend.readManifest(settings);
-      const hasRemoteState = Boolean(
-        Object.keys(manifest?.devices || {}).length > 0 ||
-        Object.keys(manifest?.files || {}).length > 0
-      );
-      return !hasRemoteState;
+      // Only check for remote files, not just device registrations.
+      // A device registration alone (from registerDevice) shouldn't prevent bootstrap.
+      const hasRemoteFiles = Object.keys(manifest?.files || {}).length > 0;
+      return !hasRemoteFiles;
     } catch {
       return false;
     }
