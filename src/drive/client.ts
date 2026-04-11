@@ -995,7 +995,7 @@ export class GoogleDriveClient {
   async downloadSnapshot(
     snapshotMeta: { generationId?: string | null } | null,
     snapshotPublishMode?: string
-  ): Promise<Array<{ path: string; content: string }>> {
+  ): Promise<Array<{ path: string; content: string | Uint8Array }>> {
     const prefix = snapshotPublishMode === "generations" && snapshotMeta?.generationId
       ? `snapshots/generations/${snapshotMeta.generationId}/vault/`
       : "vault/";
@@ -1008,8 +1008,7 @@ export class GoogleDriveClient {
       (left.appProperties?.logicalPath ?? "").localeCompare(right.appProperties?.logicalPath ?? "")
     );
 
-    const results: Array<{ path: string; content: string }> = [];
-    // Concurrent downloads (up to 5 parallel requests)
+    const results: Array<{ path: string; content: string | Uint8Array }> = [];
     const downloadQueue = snapshotFiles.filter((f) => f.appProperties?.logicalPath);
     const concurrency = 5;
     const queue = downloadQueue.slice();
@@ -1017,11 +1016,17 @@ export class GoogleDriveClient {
       while (queue.length > 0) {
         const file = queue.shift()!;
         const logicalPath = file.appProperties!.logicalPath!;
-        const content = await this.readFile(logicalPath);
-        results.push({
-          path: logicalPath.slice(prefix.length),
-          content: content ?? ""
-        });
+        const filePath = logicalPath.slice(prefix.length);
+        // Use binary download for binary file types
+        const binaryExts = ["png", "jpg", "jpeg", "gif", "bmp", "svg", "mp3", "mp4", "wav", "ogg", "webm", "webp", "pdf", "zip", "tar", "gz", "woff", "woff2", "ttf", "otf", "ico"];
+        const ext = (filePath.split(".").pop() || "").toLowerCase();
+        if (binaryExts.includes(ext)) {
+          const content = await this.readFileBinary(logicalPath);
+          results.push({ path: filePath, content: content ?? new Uint8Array(0) });
+        } else {
+          const content = await this.readFile(logicalPath);
+          results.push({ path: filePath, content: content ?? "" });
+        }
       }
     });
     await Promise.all(workers);

@@ -43,23 +43,54 @@ function createSettingsStore(plugin: any) {
 
 function createLocalStateStore(plugin: any) {
   const outboxPath = `${plugin.manifest.dir}/outbox.json`;
+
+  // Encode Uint8Array content as base64 for JSON serialization
+  function prepareForSerialization(state: any): any {
+    if (!state || !state.outbox) return state;
+    return {
+      ...state,
+      outbox: state.outbox.map((entry: any) => {
+        if (entry.content instanceof Uint8Array) {
+          return { ...entry, content: Buffer.from(entry.content).toString("base64"), _contentEncoding: "base64" };
+        }
+        return entry;
+      })
+    };
+  }
+
+  // Restore base64-encoded content back to Uint8Array
+  function restoreFromSerialization(state: any): any {
+    if (!state || !state.outbox) return state;
+    return {
+      ...state,
+      outbox: state.outbox.map((entry: any) => {
+        if (entry._contentEncoding === "base64" && typeof entry.content === "string") {
+          const restored = { ...entry, content: new Uint8Array(Buffer.from(entry.content, "base64")) };
+          delete restored._contentEncoding;
+          return restored;
+        }
+        return entry;
+      })
+    };
+  }
+
   return {
     async load() {
       try {
         const raw = await plugin.app.vault.adapter.read(outboxPath);
-        return normalizeLocalState(JSON.parse(raw));
+        return restoreFromSerialization(normalizeLocalState(JSON.parse(raw)));
       } catch {
-        // Fallback: migrate from data.json if outbox.json doesn't exist yet
         const data = await loadPluginData(plugin);
         if (data.localState) {
-          return normalizeLocalState(data.localState);
+          return restoreFromSerialization(normalizeLocalState(data.localState));
         }
         return normalizeLocalState({});
       }
     },
     async save(localState: any) {
       const normalized = normalizeLocalState(localState);
-      await plugin.app.vault.adapter.write(outboxPath, JSON.stringify(normalized, null, 2));
+      const serializable = prepareForSerialization(normalized);
+      await plugin.app.vault.adapter.write(outboxPath, JSON.stringify(serializable, null, 2));
       return normalized;
     }
   };

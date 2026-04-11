@@ -43,7 +43,7 @@ export class ObsidianVaultAdapter {
       return;
     }
 
-    const content = await this.backend.fetchBlob(entry.blobHash);
+    const content = await this.backend.fetchBlob(entry.blobHash, isBinaryPath(entry.path));
     const existing = this.app.vault.getAbstractFileByPath(entry.path);
     // Use binary-safe write for binary files to avoid UTF-8 corruption
     if (isBinaryPath(entry.path) && content instanceof Uint8Array) {
