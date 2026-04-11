@@ -1081,11 +1081,32 @@ export class GoogleDriveClient {
       }
     }
 
-    // Collect referenced hashes from all op-logs
+    // Collect referenced hashes from all op-logs (live + archive)
     for (const deviceId of Object.keys(manifest.devices ?? {})) {
       const body = await this.readFile(`ops/live/${deviceId}.jsonl`);
       if (body) {
         for (const line of body.split("\n").filter(Boolean)) {
+          try {
+            const entry = JSON.parse(line);
+            if (entry.blobHash) referencedHashes.add(entry.blobHash);
+            if (entry.parentBlobHashes) {
+              for (const h of entry.parentBlobHashes) referencedHashes.add(h);
+            }
+          } catch { /* skip malformed lines */ }
+        }
+      }
+    }
+
+    // Also scan archive logs for referenced hashes
+    const archiveScanFiles = await this.listManagedFiles();
+    const archiveFiles = archiveScanFiles.filter((f) => {
+      const lp = f.appProperties?.logicalPath;
+      return lp && lp.startsWith("ops/archive/") && lp.endsWith(".jsonl");
+    });
+    for (const archiveFile of archiveFiles) {
+      const archiveBody = await this.readFile(archiveFile.appProperties?.logicalPath || "");
+      if (archiveBody) {
+        for (const line of archiveBody.split("\n").filter(Boolean)) {
           try {
             const entry = JSON.parse(line);
             if (entry.blobHash) referencedHashes.add(entry.blobHash);

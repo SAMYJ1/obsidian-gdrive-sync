@@ -591,12 +591,26 @@ export class SyncEngine {
               (e: any) => e.op === "delete" && e.path === hydratedEntry.path && e.status !== "committed"
             );
             if (pendingDelete) {
-              // Local deleted, remote modified — restore with conflict marker
+              // Local deleted, remote modified — apply remote version and create conflict marker
               this.lastSyncHadConflicts = true;
+              // Apply the remote modification to restore the file
+              await this.vaultAdapter.applyRemoteOperation(hydratedEntry);
+              // Write conflict marker noting the file was locally deleted
               await this.resolveDeleteModifyConflict(
-                { path: hydratedEntry.path, content: pendingDelete.content },
+                { path: hydratedEntry.path, content: hydratedEntry.content || "" },
                 hydratedEntry
               );
+              // Update tracked state with the remote version
+              const existingFile = state.files[hydratedEntry.path] || {};
+              state = updateTrackedFile(state, {
+                path: hydratedEntry.path,
+                fileId: hydratedEntry.fileId || existingFile.fileId || createFileId(),
+                version: hydratedEntry.version || ((existingFile.version || 0) + 1),
+                blobHash: hydratedEntry.blobHash,
+                content: hydratedEntry.content,
+                lastModifiedBy: hydratedEntry.device,
+                updatedAt: hydratedEntry.ts || this.now()
+              });
               continue;
             }
           }
