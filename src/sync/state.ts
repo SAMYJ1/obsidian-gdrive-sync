@@ -41,8 +41,23 @@ export const DEFAULT_LOCAL_STATE: LocalState = {
   changesPageToken: null
 };
 
+function cloneValue<T>(value: T): T {
+  if (value instanceof Uint8Array) {
+    return new Uint8Array(value) as T;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => cloneValue(item)) as T;
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, entry]) => [key, cloneValue(entry)])
+    ) as T;
+  }
+  return value;
+}
+
 function cloneState(state: LocalState): LocalState {
-  return JSON.parse(JSON.stringify(state));
+  return cloneValue(state);
 }
 
 export function normalizeLocalState(input?: Partial<LocalState> | null): LocalState {
@@ -119,4 +134,9 @@ export function updateChangesPageToken(state: LocalState, token: string): LocalS
   const next = normalizeLocalState(cloneState(state));
   next.changesPageToken = token;
   return next;
+}
+
+export function hasPendingOutboxEntries(input?: Partial<LocalState> | null): boolean {
+  const state = normalizeLocalState(input);
+  return state.outbox.some((entry) => entry.status === "pending" || entry.status === "published");
 }

@@ -8,6 +8,9 @@ export interface PushOutboxEntryInput {
   deviceId: string;
   entry: any;
   state: any;
+  vaultAdapter?: {
+    readChangeContent?(filePath: string): Promise<string | Uint8Array>;
+  };
   stateStore: {
     save(state: any): Promise<any>;
   };
@@ -19,7 +22,18 @@ export async function pushOutboxEntry(input: PushOutboxEntryInput): Promise<any>
 
   if (entry.status === "pending") {
     if (entry.op !== "delete") {
-      await retryWithBackoff(() => input.backend.uploadBlob(entry));
+      let uploadEntry = entry;
+      if (uploadEntry.content == null) {
+        const contentPath = entry.op === "rename" && entry.newPath ? entry.newPath : entry.path;
+        if (!contentPath || !input.vaultAdapter || typeof input.vaultAdapter.readChangeContent !== "function") {
+          throw new Error(`Missing content for pending entry seq=${entry.seq}`);
+        }
+        uploadEntry = {
+          ...entry,
+          content: await input.vaultAdapter.readChangeContent(contentPath)
+        };
+      }
+      await retryWithBackoff(() => input.backend.uploadBlob(uploadEntry));
     }
     const opPayload: Record<string, unknown> = {
       seq: entry.seq,
@@ -40,6 +54,23 @@ export async function pushOutboxEntry(input: PushOutboxEntryInput): Promise<any>
     );
     state = markOperationPublished(state, entry.seq, publishResult as Record<string, unknown>);
     await input.stateStore.save(state);
+  }
+
+  // For published entries, check if the manifest already has this entry committed
+  // (e.g., via reconciliation). If so, skip directly to committed.
+  if (entry.status === "published" && typeof input.backend.readManifest === "function") {
+    try {
+      const manifest = await input.backend.readManifest();
+      const device = manifest?.devices?.[input.deviceId];
+      if (device && typeof device.opsHead === "number" && device.opsHead >= entry.seq) {
+        // Manifest already reflects this entry — skip to committed
+        state = markOperationCommitted(state, entry.seq);
+        await input.stateStore.save(state);
+        return state;
+      }
+    } catch {
+      // Fall through to normal commit path
+    }
   }
 
   await commitManifestPatch({

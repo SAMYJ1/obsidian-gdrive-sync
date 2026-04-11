@@ -26,6 +26,40 @@ function createJsonResponse(payload, extra) {
 
 module.exports = (async function() {
   {
+    const client = new GoogleDriveClient({
+      fetchImpl: async function() {
+        throw new Error("fetch should not be called in path mapping test");
+      },
+      getAccessToken: async function() {
+        return "token";
+      },
+      rootFolderName: "ObsidianSync",
+      vaultName: "eugene"
+    });
+
+    assert.strictEqual(
+      client.toManagedLogicalPath("manifest.json"),
+      "eugene/manifest.json",
+      "managed paths should be namespaced by vault name"
+    );
+    assert.strictEqual(
+      client.toManagedLogicalPath("vault/20 Wiki/a.md"),
+      "eugene/vault/20 Wiki/a.md",
+      "snapshot paths should live under the vault-specific namespace"
+    );
+    assert.strictEqual(
+      client.fromManagedLogicalPath("eugene/ops/live/device-a.jsonl"),
+      "ops/live/device-a.jsonl",
+      "managed path decoding should strip the vault namespace"
+    );
+    assert.strictEqual(
+      client.fromManagedLogicalPath("other-vault/manifest.json"),
+      null,
+      "managed path decoding should ignore files from other vault namespaces"
+    );
+  }
+
+  {
     const calls = [];
     const client = new GoogleDriveClient({
       fetchImpl: async function(url) {
@@ -167,5 +201,43 @@ module.exports = (async function() {
     });
     assert.strictEqual(writeAttempts, 2, "appendOperation should retry once after a CAS conflict");
     assert.strictEqual(result.remoteOpLogId, "ops/live/device-a.jsonl#2");
+  }
+
+  {
+    const files = [
+      {
+        id: "a",
+        appProperties: {
+          logicalPath: "eugene/vault/a.md",
+          vault: "eugene"
+        }
+      },
+      {
+        id: "b",
+        appProperties: {
+          logicalPath: "other-vault/vault/b.md",
+          vault: "other-vault"
+        }
+      }
+    ];
+    const client = new GoogleDriveClient({
+      fetchImpl: async function() {
+        throw new Error("fetch should not be called in managed files filter test");
+      },
+      getAccessToken: async function() {
+        return "token";
+      },
+      vaultName: "eugene"
+    });
+    client.listFiles = async function() {
+      return files;
+    };
+
+    const managedFiles = await client.listManagedFiles();
+    assert.deepStrictEqual(
+      managedFiles.map((file) => file.id),
+      ["a"],
+      "listManagedFiles should only expose the active vault namespace"
+    );
   }
 })();

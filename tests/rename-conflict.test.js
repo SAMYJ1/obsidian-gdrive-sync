@@ -20,6 +20,7 @@ function createMemoryStore(initialValue) {
 
 module.exports = (async function() {
   const conflictCopies = [];
+  const vaultContents = new Map();
   const stateStore = createMemoryStore(normalizeLocalState());
   const settingsStore = createMemoryStore({
     snapshotPublishMode: "inplace",
@@ -49,8 +50,12 @@ module.exports = (async function() {
     },
     vaultAdapter: {
       async applyRemoteOperation() {},
+      async readChangeContent(filePath) {
+        return vaultContents.get(filePath) || "";
+      },
       async writeConflictCopy(filePath, content) {
         conflictCopies.push({ path: filePath, content: content });
+        vaultContents.set(filePath, content);
       }
     },
     now: function() {
@@ -63,9 +68,12 @@ module.exports = (async function() {
     op: "create",
     content: "hello"
   });
+  vaultContents.set("notes/original.md", "hello");
   const initialState = stateStore.snapshot();
   const original = initialState.files["notes/original.md"];
   await engine.trackRename("notes/original.md", "notes/local.md", "hello");
+  vaultContents.delete("notes/original.md");
+  vaultContents.set("notes/local.md", "hello");
 
   await engine.applyRemoteOperations([
     {

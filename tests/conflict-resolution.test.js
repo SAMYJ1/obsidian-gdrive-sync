@@ -20,6 +20,12 @@ function createTestEngine(opts) {
   var appliedOps = [];
   var writtenFiles = [];
   var conflictCopies = [];
+  var vaultContents = new Map();
+  Object.entries((opts.initialState && opts.initialState.files) || {}).forEach(([filePath, record]) => {
+    if (record && record.content != null) {
+      vaultContents.set(filePath, record.content);
+    }
+  });
 
   var fakeBackend = {
     async fetchBlob(blobHash) {
@@ -45,12 +51,28 @@ function createTestEngine(opts) {
   var fakeVaultAdapter = {
     async applyRemoteOperation(entry) {
       appliedOps.push(entry);
+      if (entry.op === "delete") {
+        vaultContents.delete(entry.path);
+        return;
+      }
+      if (entry.op === "rename" && entry.newPath) {
+        const existing = vaultContents.get(entry.path);
+        vaultContents.delete(entry.path);
+        vaultContents.set(entry.newPath, existing != null ? existing : (blobs[entry.blobHash] || ""));
+        return;
+      }
+      vaultContents.set(entry.path, blobs[entry.blobHash] || entry.content || "");
+    },
+    async readChangeContent(filePath) {
+      return vaultContents.get(filePath) || "";
     },
     async writeFile(filePath, content) {
       writtenFiles.push({ path: filePath, content: content });
+      vaultContents.set(filePath, content);
     },
     async writeConflictCopy(filePath, content) {
       conflictCopies.push({ path: filePath, content: content });
+      vaultContents.set(filePath, content);
     }
   };
 
@@ -82,7 +104,8 @@ function createTestEngine(opts) {
     stateStore: stateStore,
     appliedOps: appliedOps,
     writtenFiles: writtenFiles,
-    conflictCopies: conflictCopies
+    conflictCopies: conflictCopies,
+    vaultContents: vaultContents
   };
 }
 
@@ -142,9 +165,9 @@ module.exports = (async function() {
     assert(merged.indexOf("REMOTE-LINE4") !== -1, "clean merge: merged content should contain remote change");
     assert(merged.indexOf("<<<<<<<") === -1, "clean merge: should have no conflict markers");
     assert.strictEqual(
-      t.stateStore.snapshot().files["test.md"].content,
+      t.vaultContents.get("test.md"),
       merged,
-      "clean merge: tracked state should keep the merged content, not revert to the remote-only blob"
+      "clean merge: merged content should be written back to the vault"
     );
   }
 
@@ -200,9 +223,9 @@ module.exports = (async function() {
     assert(merged.indexOf("LOCAL-LINE2") !== -1, "conflict merge: should contain local change in markers");
     assert(merged.indexOf("REMOTE-LINE2") !== -1, "conflict merge: should contain remote change in markers");
     assert.strictEqual(
-      t.stateStore.snapshot().files["test.md"].content,
+      t.vaultContents.get("test.md"),
       merged,
-      "conflict merge: tracked state should keep the merged conflict-marked content"
+      "conflict merge: merged conflict-marked content should be written back to the vault"
     );
   }
 

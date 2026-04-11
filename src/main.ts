@@ -8,11 +8,14 @@ import { normalizeSettings, ObsidianGDriveSyncSettingTab, type PluginSettings } 
 import { SyncEngine } from "./sync/engine";
 import { RuntimeStateStore } from "./sync/runtime-state";
 import { normalizeLocalState, updateChangesPageToken } from "./sync/state";
+import { prepareLocalStateForStorage, restoreLocalStateFromStorage, stripLocalStateContent } from "./sync/local-state-serialization";
 import { createDeviceId } from "./utils/device";
+import { createObsidianFetch } from "./utils/obsidian-fetch";
 import { ObsidianVaultAdapter } from "./vault/adapter";
 import { BUILT_IN_IGNORE_PATHS } from "./vault/filter";
 import { GenerationPublisher } from "./vault/snapshot";
 import { createVaultWatcher } from "./vault/watcher";
+import { hasPendingOutboxEntries } from "./sync/state";
 
 // --- Plugin data store (ported from lib/plugin-data-store.js) ---
 
@@ -44,101 +47,25 @@ function createSettingsStore(plugin: any) {
 function createLocalStateStore(plugin: any) {
   const outboxPath = `${plugin.manifest.dir}/outbox.json`;
 
-  // Encode Uint8Array content as base64 for JSON serialization
-  function prepareForSerialization(state: any): any {
-    if (!state || !state.outbox) return state;
-    return {
-      ...state,
-      outbox: state.outbox.map((entry: any) => {
-        if (entry.content instanceof Uint8Array) {
-          return { ...entry, content: Buffer.from(entry.content).toString("base64"), _contentEncoding: "base64" };
-        }
-        return entry;
-      })
-    };
-  }
-
-  // Restore base64-encoded content back to Uint8Array
-  function restoreFromSerialization(state: any): any {
-    if (!state || !state.outbox) return state;
-    return {
-      ...state,
-      outbox: state.outbox.map((entry: any) => {
-        if (entry._contentEncoding === "base64" && typeof entry.content === "string") {
-          const restored = { ...entry, content: new Uint8Array(Buffer.from(entry.content, "base64")) };
-          delete restored._contentEncoding;
-          return restored;
-        }
-        return entry;
-      })
-    };
-  }
-
   return {
     async load() {
       try {
         const raw = await plugin.app.vault.adapter.read(outboxPath);
-        return restoreFromSerialization(normalizeLocalState(JSON.parse(raw)));
+        return stripLocalStateContent(restoreLocalStateFromStorage(normalizeLocalState(JSON.parse(raw))));
       } catch {
         const data = await loadPluginData(plugin);
         if (data.localState) {
-          return restoreFromSerialization(normalizeLocalState(data.localState));
+          return stripLocalStateContent(restoreLocalStateFromStorage(normalizeLocalState(data.localState)));
         }
         return normalizeLocalState({});
       }
     },
     async save(localState: any) {
       const normalized = normalizeLocalState(localState);
-      const serializable = prepareForSerialization(normalized);
+      const serializable = prepareLocalStateForStorage(normalized);
       await plugin.app.vault.adapter.write(outboxPath, JSON.stringify(serializable, null, 2));
       return normalized;
     }
-  };
-}
-
-function createObsidianFetch(obsidianModule: any) {
-  return async function obsidianFetch(url: string, init?: {
-    method?: string;
-    headers?: Record<string, string>;
-    body?: string | Buffer;
-  }) {
-    if (typeof obsidianModule.requestUrl !== "function") {
-      return (globalThis.fetch as any)(url, init as any);
-    }
-    const options = {
-      url,
-      method: (init && init.method) || "GET",
-      headers: init && init.headers ? { ...init.headers } : {},
-      body: init && init.body ? init.body : undefined,
-      throw: false
-    };
-    const result = await obsidianModule.requestUrl(options);
-    return {
-      ok: result.status >= 200 && result.status < 300,
-      status: result.status,
-      headers: {
-        get(name: string) {
-          const lower = name.toLowerCase();
-          const headers = result.headers || {};
-          for (const key in headers) {
-            if (key.toLowerCase() === lower) return headers[key];
-          }
-          return null;
-        }
-      },
-      text() {
-        return Promise.resolve(typeof result.text === "string" ? result.text : JSON.stringify(result.json));
-      },
-      json() {
-        return Promise.resolve(result.json);
-      },
-      arrayBuffer() {
-        if (result.arrayBuffer) {
-          return Promise.resolve(result.arrayBuffer);
-        }
-        return Promise.resolve(Buffer.from(typeof result.text === "string" ? result.text : JSON.stringify(result.json)));
-      }
-    };
   };
 }
 
@@ -159,6 +86,7 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
   syncPhase: "idle" | "pushing" | "pulling" | "merging" | "finalizing" = "idle";
   pendingSyncTrigger = false;
   statusBarEl: any;
+  ribbonIconEl: any;
 
   async onload(): Promise<void> {
     const rawData = await loadPluginData(this);
@@ -180,9 +108,10 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
     });
     this.runtimeStateStore.recoverIfStale();
 
+    const driveFetch = createObsidianFetch(obsidian);
     this.driveClient = new GoogleDriveClient({
-      fetchImpl: createObsidianFetch(obsidian),
-      getAccessToken: () => fetchAccessToken(this.settingsStore, createObsidianFetch(obsidian) as any),
+      fetchImpl: driveFetch,
+      getAccessToken: () => fetchAccessToken(this.settingsStore, driveFetch as any),
       rootFolderName: this.settings.rootFolderName,
       vaultName: this.app.vault.getName()
     });
@@ -223,17 +152,34 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
         await this.runSyncNow();
       }
     });
-    this.addRibbonIcon("refresh-cw", "Sync now", async () => {
+    this.ribbonIconEl = this.addRibbonIcon("refresh-cw", "Sync now", async () => {
       await this.runSyncNow();
     });
+    this.ensureSyncAnimationStyle();
     this.statusBarEl = this.addStatusBarItem();
-    this.statusBarEl.setText("GDrive: idle");
+    this.updateStatusBar();
     this.registerVaultEvents();
     this.registerForegroundPollingHooks();
     this.startPolling();
     this.runInitialSyncIfNeeded().catch((error: unknown) => {
       console.warn("obsidian-gdrive-sync: initial sync failed", error);
+      this.writeDebugLog("initial-sync-failed", error);
     });
+  }
+
+  private writeDebugLog(label: string, data: unknown): void {
+    try {
+      const logPath = this.app.vault.configDir + "/plugins/" + this.manifest.id + "/debug.log";
+      const ts = new Date().toISOString();
+      const line = `[${ts}] ${label}: ${data instanceof Error ? data.stack || data.message : JSON.stringify(data)}\n`;
+      const existing = (() => { try { return require("fs").readFileSync(
+        (this.app.vault.adapter as any).getBasePath() + "/" + logPath, "utf8"
+      ); } catch { return ""; } })();
+      require("fs").writeFileSync(
+        (this.app.vault.adapter as any).getBasePath() + "/" + logPath,
+        existing + line
+      );
+    } catch { /* best effort */ }
   }
 
   async onunload(): Promise<void> {
@@ -331,6 +277,7 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
         state = updateChangesPageToken(state, token);
         await this.stateStore.save(state);
         if (this.isColdStartCandidate(state)) {
+          this.writeDebugLog("poll", "cold start candidate detected, running sync");
           await this.runSyncNow();
           return;
         }
@@ -349,12 +296,35 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
         await this.stateStore.save(state);
       }
       if (hasChanges) {
+        this.writeDebugLog("poll", "remote changes detected, running sync");
         await this.runSyncNow();
       }
     } catch (error) {
+      this.writeDebugLog("poll-error", error);
       console.warn("obsidian-gdrive-sync: poll failed, falling back to full sync", error);
       await this.runSyncNow();
     }
+  }
+
+  ensureSyncAnimationStyle(): void {
+    if (typeof document === "undefined") {
+      return;
+    }
+    if (document.getElementById("obsidian-gdrive-sync-style")) {
+      return;
+    }
+    const styleEl = document.createElement("style");
+    styleEl.id = "obsidian-gdrive-sync-style";
+    styleEl.textContent = `
+      @keyframes obsidian-gdrive-sync-spin {
+        from { transform: rotate(0deg); }
+        to { transform: rotate(360deg); }
+      }
+      .obsidian-gdrive-sync-is-syncing svg {
+        animation: obsidian-gdrive-sync-spin 1s linear infinite;
+      }
+    `;
+    document.head.appendChild(styleEl);
   }
 
   private updateStatusBar(): void {
@@ -367,6 +337,13 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
       finalizing: "GDrive: finalizing…"
     };
     this.statusBarEl.setText(labels[this.syncPhase] || `GDrive: ${this.syncPhase}`);
+    if (this.ribbonIconEl) {
+      if (this.syncPhase === "idle") {
+        this.ribbonIconEl.removeClass("obsidian-gdrive-sync-is-syncing");
+      } else {
+        this.ribbonIconEl.addClass("obsidian-gdrive-sync-is-syncing");
+      }
+    }
   }
 
   async runSyncNow(): Promise<void> {
@@ -377,14 +354,19 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
     this.syncPhase = "pushing";
     this.updateStatusBar();
     try {
+      this.writeDebugLog("sync-start", "beginning sync cycle");
       await this.syncEngine.syncNow({
         onPhaseChange: (phase: string) => {
+          this.writeDebugLog("phase-change", phase);
           if (phase === "pushing" || phase === "pulling" || phase === "merging" || phase === "finalizing") {
             this.syncPhase = phase;
             this.updateStatusBar();
           }
         }
       });
+      this.writeDebugLog("sync-complete", "sync cycle finished");
+    } catch (syncError: unknown) {
+      this.writeDebugLog("sync-error", syncError);
     } finally {
       this.syncPhase = "idle";
       this.updateStatusBar();
@@ -400,9 +382,11 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
       return;
     }
     const state = await this.stateStore.load();
-    if (this.isColdStartCandidate(state)) {
+    if (hasPendingOutboxEntries(state)) {
       await this.runSyncNow();
+      return;
     }
+    await this.handleForegroundSyncTrigger();
   }
 
   isColdStartCandidate(state: any): boolean {
@@ -435,7 +419,7 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
         } else {
           this.startPolling();
           if (this.settings.pollMode === "foreground" && document.visibilityState !== "hidden") {
-            this.runSyncNow().catch((error: unknown) => new obsidian.Notice(String(error)));
+            this.handleForegroundSyncTrigger().catch((error: unknown) => new obsidian.Notice(String(error)));
           }
         }
       });
@@ -444,10 +428,19 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
       this.registerDomEvent(window, "focus", () => {
         if (this.settings.pollMode === "foreground") {
           this.startPolling();
-          this.runSyncNow().catch((error: unknown) => new obsidian.Notice(String(error)));
+          this.handleForegroundSyncTrigger().catch((error: unknown) => new obsidian.Notice(String(error)));
         }
       });
     }
+  }
+
+  async handleForegroundSyncTrigger(): Promise<void> {
+    const state = await this.stateStore.load();
+    if (hasPendingOutboxEntries(state)) {
+      await this.runSyncNow();
+      return;
+    }
+    await this.pollForChanges();
   }
 
   async startGoogleAuth(): Promise<void> {

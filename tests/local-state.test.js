@@ -6,7 +6,8 @@ const {
   bindReservedOperation,
   markOperationPublished,
   markOperationCommitted,
-  updateCursorVector
+  updateCursorVector,
+  hasPendingOutboxEntries
 } = require("../dist/sync/state");
 
 let state = normalizeLocalState();
@@ -48,4 +49,49 @@ assert.deepStrictEqual(
     "device-b": 5
   },
   "cursor vectors should be replaceable in one step"
+);
+
+assert.strictEqual(
+  hasPendingOutboxEntries(state),
+  false,
+  "state without pending or published outbox entries should not trigger a foreground sync"
+);
+
+const pendingState = normalizeLocalState({
+  outbox: [
+    { seq: 2, status: "pending", op: "modify", path: "note.md" }
+  ]
+});
+assert.strictEqual(
+  hasPendingOutboxEntries(pendingState),
+  true,
+  "pending outbox entries should be detected"
+);
+
+let binaryState = normalizeLocalState({
+  outbox: [
+    {
+      seq: 9,
+      status: "pending",
+      op: "create",
+      path: "attachments/image.png",
+      content: new Uint8Array([137, 80, 78, 71])
+    }
+  ],
+  files: {
+    "attachments/image.png": {
+      path: "attachments/image.png",
+      content: new Uint8Array([137, 80, 78, 71])
+    }
+  }
+});
+binaryState = markOperationPublished(binaryState, 9, { remoteOpLogId: "remote-op-9" });
+binaryState = updateCursorVector(binaryState, { "device-a": 11 });
+assert.ok(
+  binaryState.outbox[0].content instanceof Uint8Array,
+  "outbox binary content should remain a Uint8Array after state mutations"
+);
+assert.ok(
+  binaryState.files["attachments/image.png"].content instanceof Uint8Array,
+  "tracked file binary content should remain a Uint8Array after state mutations"
 );

@@ -37,6 +37,10 @@ export class GoogleDriveBackend {
         return await this.driveClient.writeManifest(manifestPatch);
       } catch (error: any) {
         if (error?.status === 412 && attempt < maxRetries - 1) {
+          // Reset ETag so next writeManifest re-reads fresh manifest + ETag
+          if (typeof this.driveClient.resetManifestETag === "function") {
+            this.driveClient.resetManifestETag();
+          }
           continue;
         }
         throw error;

@@ -199,6 +199,34 @@ export class GoogleDriveClient {
     this.resumableUploadThresholdBytes = options.resumableUploadThresholdBytes ?? 5 * 1024 * 1024;
   }
 
+  toManagedLogicalPath(logicalPath: string): string {
+    const normalized = (logicalPath || "").replace(/^\/+|\/+$/g, "");
+    return normalized ? `${this.vaultName}/${normalized}` : this.vaultName;
+  }
+
+  fromManagedLogicalPath(managedLogicalPath?: string | null): string | null {
+    const normalized = (managedLogicalPath || "").replace(/^\/+|\/+$/g, "");
+    if (!normalized) {
+      return null;
+    }
+    if (normalized === this.vaultName) {
+      return "";
+    }
+    const prefix = `${this.vaultName}/`;
+    if (!normalized.startsWith(prefix)) {
+      return null;
+    }
+    return normalized.slice(prefix.length);
+  }
+
+  private buildManagedAppProperties(managedLogicalPath: string, kind: string): Record<string, string> {
+    return {
+      logicalPath: managedLogicalPath,
+      kind,
+      vault: this.vaultName
+    };
+  }
+
   async request(
     method: string,
     resourcePath: string,
@@ -330,11 +358,7 @@ export class GoogleDriveClient {
   }
 
   buildAppProperties(logicalPath: string, kind: string): Record<string, string> {
-    return {
-      logicalPath,
-      kind,
-      vault: this.vaultName
-    };
+    return this.buildManagedAppProperties(this.toManagedLogicalPath(logicalPath), kind);
   }
 
   async listFiles(query: string): Promise<DriveFileRecord[]> {
@@ -370,25 +394,52 @@ export class GoogleDriveClient {
         name: this.rootFolderName,
         mimeType: "application/vnd.google-apps.folder",
         appProperties: {
-          kind: "root",
-          vault: this.vaultName
+          kind: "root"
         }
       })
     });
   }
 
+  async ensureVaultFolder(): Promise<DriveFileRecord> {
+    const existing = await this.findByManagedLogicalPath(this.vaultName);
+    if (existing) {
+      return existing;
+    }
+    const root = await this.ensureRootFolder();
+    return this.createFolder(this.vaultName, root.id, this.vaultName, "vault-root");
+  }
+
   async findByLogicalPath(logicalPath: string): Promise<DriveFileRecord | null> {
+    return this.findByManagedLogicalPath(this.toManagedLogicalPath(logicalPath));
+  }
+
+  async findByManagedLogicalPath(managedLogicalPath: string): Promise<DriveFileRecord | null> {
     const files = await this.listFiles(
-      `appProperties has { key='logicalPath' and value='${logicalPath}' } and trashed=false`
+      `appProperties has { key='logicalPath' and value='${managedLogicalPath}' } and trashed=false`
     );
     return files[0] ?? null;
   }
 
   async listManagedFiles(): Promise<DriveFileRecord[]> {
-    return this.listFiles(`appProperties has { key='vault' and value='${this.vaultName}' } and trashed=false`);
+    const files = await this.listFiles(`appProperties has { key='vault' and value='${this.vaultName}' } and trashed=false`);
+    return files
+      .map((file) => {
+        const decodedLogicalPath = this.fromManagedLogicalPath(file.appProperties?.logicalPath);
+        if (decodedLogicalPath == null) {
+          return null;
+        }
+        return {
+          ...file,
+          appProperties: {
+            ...(file.appProperties || {}),
+            logicalPath: decodedLogicalPath
+          }
+        };
+      })
+      .filter(Boolean) as DriveFileRecord[];
   }
 
-  async createFolder(name: string, parentId: string | undefined, logicalPath: string): Promise<DriveFileRecord> {
+  async createFolder(name: string, parentId: string | undefined, managedLogicalPath: string, kind = "folder"): Promise<DriveFileRecord> {
     return this.requestJson("POST", "/drive/v3/files", {
       headers: {
         "Content-Type": "application/json"
@@ -397,24 +448,24 @@ export class GoogleDriveClient {
         name,
         mimeType: "application/vnd.google-apps.folder",
         parents: parentId ? [parentId] : undefined,
-        appProperties: this.buildAppProperties(logicalPath, "folder")
+        appProperties: this.buildManagedAppProperties(managedLogicalPath, kind)
       })
     });
   }
 
   async ensureFolder(logicalFolderPath: string): Promise<string> {
-    const root = await this.ensureRootFolder();
+    const vaultRoot = await this.ensureVaultFolder();
     const parts = logicalFolderPath.split("/").filter(Boolean);
-    let currentParentId = root.id;
-    let currentPath = "";
+    let currentParentId = vaultRoot.id;
+    let currentManagedPath = this.vaultName;
 
     for (const part of parts) {
-      currentPath = currentPath ? `${currentPath}/${part}` : part;
-      const existing = await this.findByLogicalPath(currentPath);
+      currentManagedPath = `${currentManagedPath}/${part}`;
+      const existing = await this.findByManagedLogicalPath(currentManagedPath);
       if (existing) {
         currentParentId = existing.id;
       } else {
-        const created = await this.createFolder(part, currentParentId, currentPath);
+        const created = await this.createFolder(part, currentParentId, currentManagedPath);
         currentParentId = created.id;
       }
     }
@@ -430,7 +481,7 @@ export class GoogleDriveClient {
   ): Promise<any> {
     const fileName = logicalPath.split("/").pop() ?? logicalPath;
     const parentPath = logicalPath.split("/").slice(0, -1).join("/");
-    const parentId = parentPath ? await this.ensureFolder(parentPath) : (await this.ensureRootFolder()).id;
+    const parentId = parentPath ? await this.ensureFolder(parentPath) : (await this.ensureVaultFolder()).id;
     const existing = await this.findByLogicalPath(logicalPath);
     const contentBuffer = this.toContentBuffer(content);
     if (contentBuffer.length > this.resumableUploadThresholdBytes) {
@@ -751,13 +802,16 @@ export class GoogleDriveClient {
     return JSON.parse(body) as ManifestRecord;
   }
 
+  resetManifestETag(): void {
+    this.manifestETag = null;
+  }
+
   async writeManifest(patch: ManifestPatch): Promise<ManifestRecord> {
-    // Spec §2: ETag-based CAS — preserve the ETag from the caller's original read.
-    // The internal readManifest here is to get the latest manifest content to apply
-    // patches against, but we must use the previously-observed ETag for the conditional
-    // write so concurrent modifications trigger HTTP 412.
-    const casETag = this.manifestETag;
+    // Re-read manifest to get fresh content and ETag atomically.
+    // readManifest() updates this.manifestETag as a side-effect,
+    // and we use that fresh ETag for the conditional write.
     const manifest = await this.readManifest();
+    const casETag = this.manifestETag;
     const device = manifest.devices[patch.deviceId] ?? {};
     let opsHead = device.opsHead ?? 0;
     const now = this.now();

@@ -20,9 +20,13 @@ function createMemoryStore(initialValue) {
 module.exports = (async function () {
   const backendCalls = [];
   let lastCursorWrite = null;
+  const vaultContents = new Map([
+    ["20 Wiki/Topics/example.md", "hello"],
+    ["20 Wiki/Topics/removed.md", "bye"]
+  ]);
   const fakeBackend = {
     async uploadBlob(change) {
-      backendCalls.push(["uploadBlob", change.path]);
+      backendCalls.push(["uploadBlob", change.path, change.content]);
       return "sha256:" + change.path;
     },
     async appendOperation(entry) {
@@ -79,8 +83,14 @@ module.exports = (async function () {
       completeRemoteApply() {}
     },
     vaultAdapter: {
+      async readChangeContent(filePath) {
+        return vaultContents.get(filePath) || "";
+      },
       async applyRemoteOperation(entry) {
         appliedRemoteOps.push(entry);
+        if (entry.path === "20 Wiki/Topics/remote.md") {
+          vaultContents.set(entry.path, "remote");
+        }
       }
     },
     now: function () {
@@ -103,6 +113,17 @@ module.exports = (async function () {
     op: "delete",
     content: ""
   });
+  const trackedState = stateStore.snapshot();
+  assert.strictEqual(
+    trackedState.outbox[0].content,
+    undefined,
+    "pending outbox entries should not retain full file content in state"
+  );
+  assert.strictEqual(
+    trackedState.files["20 Wiki/Topics/example.md"].content,
+    undefined,
+    "tracked files should not retain full file content in state"
+  );
   await engine.syncNow();
 
   const finalState = stateStore.snapshot();
@@ -110,6 +131,12 @@ module.exports = (async function () {
   assert(
     backendCalls.some((entry) => entry[0] === "uploadBlob"),
     "sync should upload changed blobs"
+  );
+  const firstUpload = backendCalls.find((entry) => entry[0] === "uploadBlob");
+  assert.strictEqual(
+    firstUpload[2],
+    "hello",
+    "sync should read current vault content when uploading a pending local change"
   );
   assert(
     backendCalls.some((entry) => entry[0] === "appendOperation"),

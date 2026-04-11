@@ -159,7 +159,6 @@ export async function coldStart(options: {
         fileId: manifestRecord.fileId || file.path,
         version: manifestRecord.version || 1,
         blobHash: manifestRecord.blobHash || null,
-        content: file.content,
         lastModifiedBy: manifestRecord.lastModifiedBy || null,
         updatedAt: manifestRecord.updatedAt || null
       });
@@ -318,7 +317,6 @@ export class SyncEngine {
       fileId,
       blobHash,
       parentBlobHashes: parentBlobHash ? [parentBlobHash] : [],
-      content: change.op === "delete" ? undefined : change.content,
       version: nextVersion
     });
 
@@ -331,7 +329,6 @@ export class SyncEngine {
         version: nextVersion,
         blobHash,
         parentBlobHashes: parentBlobHash ? [parentBlobHash] : [],
-        content: change.content,
         lastModifiedBy: this.deviceId,
         updatedAt: this.now()
       });
@@ -367,7 +364,6 @@ export class SyncEngine {
       fileId,
       blobHash,
       parentBlobHashes: parentBlobHash ? [parentBlobHash] : [],
-      content,
       version: nextVersion
     });
     state = removeTrackedFile(state, oldPath);
@@ -377,7 +373,6 @@ export class SyncEngine {
       version: existingFile ? nextVersion : 1,
       blobHash,
       parentBlobHashes: parentBlobHash ? [parentBlobHash] : [],
-      content,
       renamedFrom: oldPath,
       renamedTo: newPath,
       lastModifiedBy: this.deviceId,
@@ -393,10 +388,15 @@ export class SyncEngine {
     const settings = await this.loadSettings();
     const changedPaths = new Set<string>();
     const deletedPaths = new Set<string>();
-    const renamedFiles: Array<{ from: string; to: string; content?: string }> = [];
+    const renamedFiles: Array<{ from: string; to: string; content?: string | Uint8Array }> = [];
 
     state = pruneStaleReservedEntries(state);
     await this.stateStore.save(state);
+
+    if (await this.shouldBootstrapLocalVault(state, settings)) {
+      await this.bootstrapLocalVault(state, settings);
+      state = await this.loadState();
+    }
 
     if (await this.shouldColdStart(state, settings)) {
       await coldStart({
@@ -413,6 +413,9 @@ export class SyncEngine {
     onPhaseChange("pushing");
     let pushHadErrors = false;
     let pushHadVersionConflict = false;
+    let consecutiveFailures = 0;
+    const maxConsecutiveFailures = 5;
+    console.log(`obsidian-gdrive-sync: push phase starting, ${state.outbox.length} outbox entries`);
     for (const entry of state.outbox.slice()) {
       if (entry.status !== "pending" && entry.status !== "published") {
         continue;
@@ -423,8 +426,10 @@ export class SyncEngine {
           deviceId: this.deviceId,
           entry,
           state,
+          vaultAdapter: this.vaultAdapter,
           stateStore: this.stateStore
         });
+        consecutiveFailures = 0;
 
         if (entry.op === "delete") {
           deletedPaths.add(`vault/${entry.path}`);
@@ -433,8 +438,7 @@ export class SyncEngine {
           changedPaths.add(entry.newPath);
           renamedFiles.push({
             from: `vault/${entry.path}`,
-            to: `vault/${entry.newPath}`,
-            content: entry.content || ""
+            to: `vault/${entry.newPath}`
           });
         } else {
           changedPaths.add(entry.path);
@@ -447,13 +451,21 @@ export class SyncEngine {
         } else {
           console.warn(`obsidian-gdrive-sync: push failed for entry seq=${entry.seq}`, pushError);
           pushHadErrors = true;
+          consecutiveFailures++;
+          // Stop trying more entries if we hit too many consecutive failures
+          // (likely a systemic issue like auth or network failure)
+          if (consecutiveFailures >= maxConsecutiveFailures) {
+            console.warn(`obsidian-gdrive-sync: ${maxConsecutiveFailures} consecutive push failures, stopping push phase`);
+            break;
+          }
         }
       }
     }
 
-    // Spec §7 state machine: PUSHING → FINALIZING on non-conflict error (skip pull/merge)
-    // But version conflicts proceed to pulling to trigger conflict merge (spec §2)
-    if (pushHadErrors && !pushHadVersionConflict) {
+    // Spec §7 state machine: continue to pull phase even with push errors.
+    // Individual entry failures are retried on next sync; only skip pull
+    // if all entries failed consecutively (systemic failure like auth issues).
+    if (pushHadErrors && !pushHadVersionConflict && consecutiveFailures >= maxConsecutiveFailures) {
       onPhaseChange("finalizing");
       await this.stateStore.save(state);
       return { state, remoteOperations: [] };
@@ -506,9 +518,10 @@ export class SyncEngine {
     const changedFiles = [];
     for (const filePath of changedPaths) {
       if (state.files[filePath]) {
+        const content = await this.readTrackedFileContent(state.files[filePath], filePath);
         changedFiles.push({
           path: `vault/${filePath}`,
-          content: state.files[filePath].content || ""
+          content
         });
       }
     }
@@ -552,6 +565,47 @@ export class SyncEngine {
       state,
       remoteOperations
     };
+  }
+
+  async shouldBootstrapLocalVault(state: any, settings: any): Promise<boolean> {
+    if (!this.vaultAdapter || typeof this.vaultAdapter.listSnapshotFiles !== "function") {
+      return false;
+    }
+    const normalized = normalizeLocalState(state);
+    if (Object.keys(normalized.cursorByDevice || {}).length > 0) {
+      return false;
+    }
+    if (typeof this.backend.readManifest !== "function") {
+      return false;
+    }
+    try {
+      const manifest = await this.backend.readManifest(settings);
+      const hasRemoteState = Boolean(
+        Object.keys(manifest?.devices || {}).length > 0 ||
+        Object.keys(manifest?.files || {}).length > 0
+      );
+      return !hasRemoteState;
+    } catch {
+      return false;
+    }
+  }
+
+  async bootstrapLocalVault(state: any, settings: any): Promise<void> {
+    const snapshotFiles = await this.vaultAdapter.listSnapshotFiles(settings.ignorePatterns || []);
+    const queuedPaths = new Set(
+      normalizeLocalState(state).outbox.map((entry: any) => entry.newPath || entry.path).filter(Boolean)
+    );
+    for (const file of snapshotFiles) {
+      if (!file.path || queuedPaths.has(file.path)) {
+        continue;
+      }
+      await this.trackLocalChange({
+        path: file.path,
+        op: "create",
+        content: file.content
+      });
+      queuedPaths.add(file.path);
+    }
   }
 
   async applyRemoteOperations(entries: any[]): Promise<void> {
@@ -607,7 +661,6 @@ export class SyncEngine {
                 fileId: hydratedEntry.fileId || existingFile.fileId || createFileId(),
                 version: hydratedEntry.version || ((existingFile.version || 0) + 1),
                 blobHash: hydratedEntry.blobHash,
-                content: hydratedEntry.content,
                 lastModifiedBy: hydratedEntry.device,
                 updatedAt: hydratedEntry.ts || this.now()
               });
@@ -637,7 +690,6 @@ export class SyncEngine {
                 version: mergedVersion,
                 blobHash: mergedBlobHash,
                 parentBlobHashes: [localFile.blobHash, hydratedEntry.blobHash],
-                content: mergedContent,
                 lastModifiedBy: this.deviceId,
                 updatedAt: this.now()
               });
@@ -655,7 +707,6 @@ export class SyncEngine {
                 fileId: mergedFileId,
                 blobHash: mergedBlobHash,
                 parentBlobHashes: [localFile.blobHash, hydratedEntry.blobHash],
-                content: mergedContent,
                 version: mergedVersion
               });
               await this.stateStore.save(state);
@@ -708,7 +759,6 @@ export class SyncEngine {
                 version: (localRenameFile.version || 0) + 1,
                 blobHash: hydratedEntry.blobHash,
                 parentBlobHashes: hydratedEntry.parentBlobHashes || [],
-                content: hydratedEntry.content,
                 lastModifiedBy: hydratedEntry.device,
                 updatedAt: hydratedEntry.ts || this.now()
               });
@@ -730,7 +780,6 @@ export class SyncEngine {
                 version: (localFile.version || 0) + 1,
                 blobHash: (renameResolution && renameResolution.blobHash) || hydratedEntry.blobHash,
                 parentBlobHashes: [localFile.blobHash, hydratedEntry.blobHash],
-                content: (renameResolution && renameResolution.content) || hydratedEntry.content,
                 lastModifiedBy: (renameResolution && renameResolution.lastModifiedBy) || hydratedEntry.device,
                 updatedAt: (renameResolution && renameResolution.updatedAt) || hydratedEntry.ts || this.now()
               });
@@ -750,7 +799,6 @@ export class SyncEngine {
               version: (existingFile.version || 0) + 1,
               blobHash: hydratedEntry.blobHash,
               parentBlobHashes: hydratedEntry.parentBlobHashes || [],
-              content: hydratedEntry.content,
               lastModifiedBy: hydratedEntry.device,
               updatedAt: hydratedEntry.ts || this.now()
             });
@@ -762,7 +810,6 @@ export class SyncEngine {
               version: hydratedEntry.version || ((existingFile.version || 0) + 1),
               blobHash: hydratedEntry.blobHash,
               parentBlobHashes: hydratedEntry.parentBlobHashes || [],
-              content: hydratedEntry.content,
               lastModifiedBy: hydratedEntry.device,
               updatedAt: hydratedEntry.ts || this.now()
             });
@@ -775,6 +822,30 @@ export class SyncEngine {
         this.runtimeStateStore.completeRemoteApply();
       }
     }
+  }
+
+  resolveTrackedFilePath(fileRecord: any, fallbackPath?: string): string {
+    return fileRecord?.renamedTo || fileRecord?.path || fallbackPath || "";
+  }
+
+  async readTrackedFileContent(fileRecord: any, fallbackPath?: string): Promise<string | Uint8Array> {
+    const filePath = this.resolveTrackedFilePath(fileRecord, fallbackPath);
+    if (this.vaultAdapter && typeof this.vaultAdapter.readChangeContent === "function" && filePath) {
+      try {
+        return await this.vaultAdapter.readChangeContent(filePath);
+      } catch {
+        // Fall through to any cached content still present in state.
+      }
+    }
+    return fileRecord?.content || "";
+  }
+
+  async readTrackedTextContent(fileRecord: any, fallbackPath?: string): Promise<string> {
+    const content = await this.readTrackedFileContent(fileRecord, fallbackPath);
+    if (typeof content === "string") {
+      return content;
+    }
+    return new TextDecoder().decode(content);
   }
 
   async findCommonAncestor(localFile: any, remoteOp: any): Promise<string | null> {
@@ -840,6 +911,7 @@ export class SyncEngine {
 
   async resolveModifyConflict(state: any, localFile: any, remoteOp: any): Promise<any> {
     if (isBinaryPath(remoteOp.path)) {
+      const localContent = await this.readTrackedFileContent(localFile, remoteOp.path);
       const ext = remoteOp.path.split(".").pop();
       const baseName = remoteOp.path.slice(0, remoteOp.path.length - ext.length - 1);
       // Spec §3: last-write-wins — newer version by mtime becomes primary
@@ -852,7 +924,7 @@ export class SyncEngine {
       if (this.vaultAdapter && typeof this.vaultAdapter.writeConflictCopy === "function") {
         if (remoteIsNewer) {
           // Remote is newer → remote becomes primary, local becomes conflict copy
-          await this.vaultAdapter.writeConflictCopy(conflictPath, localFile.content || "");
+          await this.vaultAdapter.writeConflictCopy(conflictPath, localContent);
           await this.vaultAdapter.applyRemoteOperation(remoteOp);
           return {
             blobHash: remoteOp.blobHash,
@@ -865,7 +937,7 @@ export class SyncEngine {
           await this.vaultAdapter.writeConflictCopy(conflictPath, remoteOp.content || "");
           return {
             blobHash: localFile.blobHash,
-            content: localFile.content,
+            content: localContent,
             lastModifiedBy: localFile.lastModifiedBy,
             updatedAt: localFile.updatedAt || this.now()
           };
@@ -884,7 +956,10 @@ export class SyncEngine {
     let baseContent = "";
     if (ancestorHash) {
       try {
-        baseContent = await this.backend.fetchBlob(ancestorHash);
+        const fetchedBaseContent = await this.backend.fetchBlob(ancestorHash);
+        baseContent = typeof fetchedBaseContent === "string"
+          ? fetchedBaseContent
+          : new TextDecoder().decode(fetchedBaseContent);
       } catch {
         baseContent = "";
       }
@@ -895,10 +970,13 @@ export class SyncEngine {
         this.notifyUser(`Merge conflict in ${remoteOp.path}: no common ancestor found, using two-way diff`);
       }
     }
-    const localContent = localFile.content || "";
+    const localContent = await this.readTrackedTextContent(localFile, remoteOp.path);
     let remoteContent = "";
     try {
-      remoteContent = await this.backend.fetchBlob(remoteOp.blobHash);
+      const fetchedRemoteContent = await this.backend.fetchBlob(remoteOp.blobHash);
+      remoteContent = typeof fetchedRemoteContent === "string"
+        ? fetchedRemoteContent
+        : new TextDecoder().decode(fetchedRemoteContent);
     } catch {
       remoteContent = "";
     }
@@ -926,7 +1004,8 @@ export class SyncEngine {
       conflictPath = `${remoteOp.path}.deleted-conflict`;
     }
     if (this.vaultAdapter && typeof this.vaultAdapter.writeConflictCopy === "function") {
-      await this.vaultAdapter.writeConflictCopy(conflictPath, localFile.content || "");
+      const localContent = await this.readTrackedFileContent(localFile, remoteOp.path);
+      await this.vaultAdapter.writeConflictCopy(conflictPath, localContent);
     }
   }
 
@@ -936,8 +1015,9 @@ export class SyncEngine {
     const conflictPath = `${baseName}.conflict-${this.deviceId}-${this.now()}.${ext}`;
 
     await this.vaultAdapter.applyRemoteOperation(remoteOp);
-    if (this.vaultAdapter && typeof this.vaultAdapter.writeConflictCopy === "function" && localFile.content) {
-      await this.vaultAdapter.writeConflictCopy(conflictPath, localFile.content);
+    const localContent = await this.readTrackedFileContent(localFile, remoteOp.newPath);
+    if (this.vaultAdapter && typeof this.vaultAdapter.writeConflictCopy === "function" && localContent) {
+      await this.vaultAdapter.writeConflictCopy(conflictPath, localContent);
     }
   }
 
@@ -947,14 +1027,20 @@ export class SyncEngine {
     if (renameParent && localFile.blobHash !== renameParent && !isBinaryPath(remoteOp.newPath)) {
       let baseContent = "";
       try {
-        baseContent = await this.backend.fetchBlob(renameParent);
+        const fetchedBaseContent = await this.backend.fetchBlob(renameParent);
+        baseContent = typeof fetchedBaseContent === "string"
+          ? fetchedBaseContent
+          : new TextDecoder().decode(fetchedBaseContent);
       } catch {
         baseContent = "";
       }
-      const localContent = localFile.content || "";
+      const localContent = await this.readTrackedTextContent(localFile, remoteOp.newPath);
       let remoteContent = "";
       try {
-        remoteContent = await this.backend.fetchBlob(remoteOp.blobHash);
+        const fetchedRemoteContent = await this.backend.fetchBlob(remoteOp.blobHash);
+        remoteContent = typeof fetchedRemoteContent === "string"
+          ? fetchedRemoteContent
+          : new TextDecoder().decode(fetchedRemoteContent);
       } catch {
         remoteContent = "";
       }
@@ -1113,8 +1199,23 @@ export class SyncEngine {
       }
     }
 
-    return typeof this.backend.readSnapshotMeta === "function" &&
+    if (!(typeof this.backend.readSnapshotMeta === "function" &&
       typeof this.backend.downloadSnapshot === "function" &&
-      typeof this.backend.readManifest === "function";
+      typeof this.backend.readManifest === "function")) {
+      return false;
+    }
+
+    try {
+      const manifest = await this.backend.readManifest(settings);
+      const snapshotMeta = await this.backend.readSnapshotMeta(settings);
+      return Boolean(
+        Object.keys(manifest?.devices || {}).length > 0 ||
+        Object.keys(manifest?.files || {}).length > 0 ||
+        Object.keys(snapshotMeta?.snapshotSeqs || {}).length > 0 ||
+        snapshotMeta?.generationId
+      );
+    } catch {
+      return false;
+    }
   }
 }

@@ -85,6 +85,7 @@ export function normalizeSettings(input?: Partial<PluginSettings> | null): Plugi
 
 export class ObsidianGDriveSyncSettingTab extends obsidian.PluginSettingTab {
   plugin: any;
+  activeTab: "general" | "advanced" = "general";
 
   constructor(app: any, plugin: any) {
     super(app, plugin);
@@ -94,6 +95,157 @@ export class ObsidianGDriveSyncSettingTab extends obsidian.PluginSettingTab {
   display(): void {
     const containerEl = this.containerEl;
     containerEl.empty();
+    containerEl.createEl("h2", { text: "Obsidian Google Drive Sync" });
+    containerEl.createEl("p", {
+      text: "Configure everyday sync behavior from General. Lower-level snapshot and OAuth details live under Advanced / Experimental."
+    });
+
+    this.renderTabSwitcher(containerEl);
+
+    if (this.activeTab === "general") {
+      this.renderGeneralSettings(containerEl);
+      return;
+    }
+
+    this.renderAdvancedSettings(containerEl);
+  }
+
+  private renderTabSwitcher(containerEl: any): void {
+    const tabBar = containerEl.createDiv();
+    tabBar.style.display = "flex";
+    tabBar.style.gap = "8px";
+    tabBar.style.marginBottom = "16px";
+
+    this.renderTabButton(tabBar, "General", "general");
+    this.renderTabButton(tabBar, "Advanced / Experimental", "advanced");
+  }
+
+  private renderTabButton(containerEl: any, label: string, tab: "general" | "advanced"): void {
+    const buttonEl = containerEl.createEl("button", { text: label });
+    buttonEl.type = "button";
+    if (this.activeTab === tab) {
+      buttonEl.classList.add("mod-cta");
+    }
+    buttonEl.addEventListener("click", () => {
+      if (this.activeTab === tab) {
+        return;
+      }
+      this.activeTab = tab;
+      this.display();
+    });
+  }
+
+  private renderGeneralSettings(containerEl: any): void {
+    const signedIn = Boolean(
+      this.plugin.settings.googleRefreshToken ||
+      this.plugin.settings.googleAccessToken
+    );
+
+    new obsidian.Setting(containerEl)
+      .setName("Sync now")
+      .setDesc("Run a manual sync immediately.")
+      .addButton((button: any) => {
+        button.setButtonText("Sync now").onClick(async () => {
+          try {
+            await this.plugin.runSyncNow();
+          } catch (error: any) {
+            new obsidian.Notice(String(error && error.message ? error.message : error));
+          }
+        });
+      });
+
+    new obsidian.Setting(containerEl)
+      .setName("Enable auto sync")
+      .setDesc("Automatically sync local changes and poll for remote changes.")
+      .addToggle((toggle: any) => {
+        toggle
+          .setValue(this.plugin.settings.enableAutoSync)
+          .onChange(async (value: boolean) => {
+            this.plugin.settings.enableAutoSync = value;
+            await this.plugin.saveSettings();
+            this.plugin.startPolling();
+          });
+      });
+
+    new obsidian.Setting(containerEl)
+      .setName("Poll mode")
+      .setDesc("Foreground polls only when Obsidian is visible. Always keeps polling. Manual disables background polling.")
+      .addDropdown((dropdown: any) => {
+        dropdown
+          .addOption("foreground", "Foreground")
+          .addOption("always", "Always")
+          .addOption("manual", "Manual")
+          .setValue(this.plugin.settings.pollMode)
+          .onChange(async (value: PollMode) => {
+            this.plugin.settings.pollMode = value;
+            await this.plugin.saveSettings();
+            this.plugin.startPolling();
+          });
+      });
+
+    new obsidian.Setting(containerEl)
+      .setName("Poll interval (seconds)")
+      .setDesc("How often to poll Google Drive for remote changes.")
+      .addText((text: any) => {
+        text
+          .setPlaceholder("30")
+          .setValue(String(this.plugin.settings.pollIntervalSeconds))
+          .onChange(async (value: string) => {
+            this.plugin.settings.pollIntervalSeconds = parseInt(value, 10);
+            await this.plugin.saveSettings();
+            this.plugin.startPolling();
+          });
+      });
+
+    new obsidian.Setting(containerEl)
+      .setName("Root folder name")
+      .setDesc("Top-level Google Drive folder used by this plugin.")
+      .addText((text: any) => {
+        text
+          .setPlaceholder("ObsidianSync")
+          .setValue(this.plugin.settings.rootFolderName)
+          .onChange(async (value: string) => {
+            this.plugin.settings.rootFolderName = value;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new obsidian.Setting(containerEl)
+      .setName("Google client ID")
+      .setDesc("Required before the desktop browser sign-in flow can start.")
+      .addText((text: any) => {
+        text
+          .setPlaceholder("client id")
+          .setValue(this.plugin.settings.googleClientId)
+          .onChange(async (value: string) => {
+            this.plugin.settings.googleClientId = value.trim();
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new obsidian.Setting(containerEl)
+      .setName("Google sign-in")
+      .setDesc(
+        signedIn
+          ? "Authenticated on this desktop. Access and refresh tokens are stored locally and hidden from this settings page."
+          : "Start the browser OAuth flow. Tokens are stored locally on this desktop and hidden from this settings page."
+      )
+      .addButton((button: any) => {
+        button.setButtonText(signedIn ? "Re-authenticate" : "Sign in with Google").onClick(async () => {
+          try {
+            await this.plugin.startGoogleAuth();
+            this.display();
+          } catch (error: any) {
+            new obsidian.Notice(String(error && error.message ? error.message : error));
+          }
+        });
+      });
+  }
+
+  private renderAdvancedSettings(containerEl: any): void {
+    containerEl.createEl("p", {
+      text: "These settings are lower-level or experimental. Most users should not need to change them after initial setup."
+    });
 
     new obsidian.Setting(containerEl)
       .setName("Snapshot publish mode")
@@ -106,21 +258,24 @@ export class ObsidianGDriveSyncSettingTab extends obsidian.PluginSettingTab {
           .onChange(async (value: SnapshotPublishMode) => {
             this.plugin.settings.snapshotPublishMode = value;
             await this.plugin.saveSettings();
+            this.display();
           });
       });
 
-    new obsidian.Setting(containerEl)
-      .setName("Generation retention count")
-      .setDesc("Generations mode keeps the newest published snapshots.")
-      .addText((text: any) => {
-        text
-          .setPlaceholder("3")
-          .setValue(String(this.plugin.settings.generationRetentionCount))
-          .onChange(async (value: string) => {
-            this.plugin.settings.generationRetentionCount = parseInt(value, 10);
-            await this.plugin.saveSettings();
-          });
-      });
+    if (this.plugin.settings.snapshotPublishMode === "generations") {
+      new obsidian.Setting(containerEl)
+        .setName("Generation retention count")
+        .setDesc("Generations mode keeps the newest published snapshots.")
+        .addText((text: any) => {
+          text
+            .setPlaceholder("3")
+            .setValue(String(this.plugin.settings.generationRetentionCount))
+            .onChange(async (value: string) => {
+              this.plugin.settings.generationRetentionCount = parseInt(value, 10);
+              await this.plugin.saveSettings();
+            });
+        });
+    }
 
     new obsidian.Setting(containerEl)
       .setName("Push debounce (seconds)")
@@ -149,117 +304,8 @@ export class ObsidianGDriveSyncSettingTab extends obsidian.PluginSettingTab {
       });
 
     new obsidian.Setting(containerEl)
-      .setName("Poll interval (seconds)")
-      .setDesc("How often to poll Google Drive for remote changes.")
-      .addText((text: any) => {
-        text
-          .setPlaceholder("30")
-          .setValue(String(this.plugin.settings.pollIntervalSeconds))
-          .onChange(async (value: string) => {
-            this.plugin.settings.pollIntervalSeconds = parseInt(value, 10);
-            await this.plugin.saveSettings();
-            this.plugin.startPolling();
-          });
-      });
-
-    new obsidian.Setting(containerEl)
-      .setName("Poll mode")
-      .setDesc("Foreground polls only when Obsidian is visible. Always keeps polling. Manual disables background polling.")
-      .addDropdown((dropdown: any) => {
-        dropdown
-          .addOption("foreground", "Foreground")
-          .addOption("always", "Always")
-          .addOption("manual", "Manual")
-          .setValue(this.plugin.settings.pollMode)
-          .onChange(async (value: PollMode) => {
-            this.plugin.settings.pollMode = value;
-            await this.plugin.saveSettings();
-            this.plugin.startPolling();
-          });
-      });
-
-    new obsidian.Setting(containerEl)
-      .setName("Enable auto sync")
-      .setDesc("Automatically sync local changes and poll for remote changes.")
-      .addToggle((toggle: any) => {
-        toggle
-          .setValue(this.plugin.settings.enableAutoSync)
-          .onChange(async (value: boolean) => {
-            this.plugin.settings.enableAutoSync = value;
-            await this.plugin.saveSettings();
-            this.plugin.startPolling();
-          });
-      });
-
-    new obsidian.Setting(containerEl)
-      .setName("Root folder name")
-      .setDesc("Top-level Google Drive folder used by this plugin.")
-      .addText((text: any) => {
-        text
-          .setPlaceholder("ObsidianSync")
-          .setValue(this.plugin.settings.rootFolderName)
-          .onChange(async (value: string) => {
-            this.plugin.settings.rootFolderName = value;
-            await this.plugin.saveSettings();
-          });
-      });
-
-    new obsidian.Setting(containerEl)
-      .setName("Google sign-in")
-      .setDesc("Start the browser OAuth flow. Manual token fields remain available as a fallback.")
-      .addButton((button: any) => {
-        button.setButtonText("Sign in with Google").onClick(async () => {
-          try {
-            await this.plugin.startGoogleAuth();
-            this.display();
-          } catch (error: any) {
-            new obsidian.Notice(String(error && error.message ? error.message : error));
-          }
-        });
-      });
-
-    new obsidian.Setting(containerEl)
-      .setName("Google access token")
-      .setDesc("Optional current access token for Google Drive API calls.")
-      .addTextArea((text: any) => {
-        text
-          .setPlaceholder("ya29...")
-          .setValue(this.plugin.settings.googleAccessToken)
-          .onChange(async (value: string) => {
-            this.plugin.settings.googleAccessToken = value.trim();
-            await this.plugin.saveSettings();
-          });
-      });
-
-    new obsidian.Setting(containerEl)
-      .setName("Google refresh token")
-      .setDesc("Optional refresh token used to renew the Google access token.")
-      .addTextArea((text: any) => {
-        text
-          .setPlaceholder("1//...")
-          .setValue(this.plugin.settings.googleRefreshToken)
-          .onChange(async (value: string) => {
-            this.plugin.settings.googleRefreshToken = value.trim();
-            await this.plugin.saveSettings();
-          });
-      });
-
-    new obsidian.Setting(containerEl)
-      .setName("Google client ID")
-      .setDesc("OAuth client ID used with the refresh token flow.")
-      .addText((text: any) => {
-        text
-          .setPlaceholder("client id")
-          .setValue(this.plugin.settings.googleClientId)
-          .onChange(async (value: string) => {
-            this.plugin.settings.googleClientId = value.trim();
-            await this.plugin.saveSettings();
-          });
-      });
-
-    new obsidian.Setting(containerEl)
       .setName("Google client secret")
-      .setDesc("OAuth client secret used with the refresh token flow when required.")
+      .setDesc("Optional for desktop OAuth. Usually entered once and then left alone.")
       .addText((text: any) => {
         text
           .setPlaceholder("client secret")
@@ -268,6 +314,9 @@ export class ObsidianGDriveSyncSettingTab extends obsidian.PluginSettingTab {
             this.plugin.settings.googleClientSecret = value.trim();
             await this.plugin.saveSettings();
           });
+        if (text.inputEl) {
+          text.inputEl.type = "password";
+        }
       });
 
     new obsidian.Setting(containerEl)

@@ -46,6 +46,11 @@ module.exports = (async function() {
       beginRemoteApply() {},
       completeRemoteApply() {}
     },
+    vaultAdapter: {
+      async readChangeContent(filePath) {
+        return filePath === "notes/a.md" ? "hello" : "";
+      }
+    },
     now: function() {
       return 1000;
     }

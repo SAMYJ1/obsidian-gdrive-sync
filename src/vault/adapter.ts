@@ -1,5 +1,6 @@
 const obsidian = require("obsidian");
 import { isBinaryPath } from "../sync/merge";
+import { isIgnoredPath } from "./filter";
 
 export class ObsidianVaultAdapter {
   private readonly app: any;
@@ -128,5 +129,21 @@ export class ObsidianVaultAdapter {
     } else {
       await this.app.vault.create(filePath, content);
     }
+  }
+
+  async listSnapshotFiles(ignorePatterns: string[] = []): Promise<Array<{ path: string; content: string | Uint8Array }>> {
+    const files = this.app.vault.getFiles ? this.app.vault.getFiles() : [];
+    const snapshotFiles: Array<{ path: string; content: string | Uint8Array }> = [];
+    for (const file of files) {
+      if (!file || !file.path || isIgnoredPath(file.path, ignorePatterns)) {
+        continue;
+      }
+      snapshotFiles.push({
+        path: file.path,
+        content: await this.readChangeContent(file.path)
+      });
+    }
+    snapshotFiles.sort((a, b) => a.path.localeCompare(b.path));
+    return snapshotFiles;
   }
 }
