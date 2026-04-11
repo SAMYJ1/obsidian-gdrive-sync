@@ -626,6 +626,18 @@ export class GoogleDriveClient {
     return response.text();
   }
 
+  async readFileBinary(logicalPath: string): Promise<Uint8Array | null> {
+    const existing = await this.findByLogicalPath(logicalPath);
+    if (!existing) {
+      return null;
+    }
+    const response = await this.request("GET", `/drive/v3/files/${existing.id}`, {
+      query: { alt: "media" }
+    });
+    const buffer = await (response as any).arrayBuffer();
+    return new Uint8Array(buffer);
+  }
+
   async copyFile(sourceLogicalPath: string, destinationLogicalPath: string): Promise<any> {
     const source = await this.findByLogicalPath(sourceLogicalPath);
     if (!source) {
@@ -891,7 +903,14 @@ export class GoogleDriveClient {
     return results;
   }
 
-  async fetchBlob(blobHash: string): Promise<string> {
+  async fetchBlob(blobHash: string, binary?: boolean): Promise<string | Uint8Array> {
+    if (binary) {
+      const data = await this.readFileBinary(`blobs/${blobHash}`);
+      if (data == null) {
+        throw new Error(`Missing blob: ${blobHash}`);
+      }
+      return data;
+    }
     const body = await this.readFile(`blobs/${blobHash}`);
     if (body == null) {
       throw new Error(`Missing blob: ${blobHash}`);

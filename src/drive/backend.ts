@@ -72,8 +72,8 @@ export class GoogleDriveBackend {
     return this.driveClient.listOperationsSince(cursorByDevice);
   }
 
-  async fetchBlob(blobHash: string): Promise<string> {
-    return this.driveClient.fetchBlob(blobHash);
+  async fetchBlob(blobHash: string, binary?: boolean): Promise<string | Uint8Array> {
+    return this.driveClient.fetchBlob(blobHash, binary);
   }
 
   async getOpsForFile(fileId: string, limit?: number): Promise<any> {
@@ -123,5 +123,9 @@ export class GoogleDriveBackend {
       snapshotPublishMode: "inplace",
       updatedAt: this.now()
     };
+  }
+
+  async garbageCollectBlobs(options?: { maxAgeMs?: number }): Promise<{ deletedCount: number }> {
+    return this.driveClient.garbageCollectBlobs(options);
   }
 }

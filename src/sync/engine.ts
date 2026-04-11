@@ -573,8 +573,33 @@ export class SyncEngine {
       if (this.vaultAdapter && typeof this.vaultAdapter.applyRemoteOperation === "function") {
         for (const entry of dedupedEntries) {
           const hydratedEntry = await this.hydrateRemoteEntry(entry);
-          const localFile = state.files[hydratedEntry.path];
+          let localFile = state.files[hydratedEntry.path];
           const localRenameFile = hydratedEntry.fileId ? this.findTrackedFileById(state, hydratedEntry.fileId) : null;
+
+          // Spec §3 rename-vs-modify: if local side renamed this fileId,
+          // retarget remote modify/create to the new path
+          if ((hydratedEntry.op === "modify" || hydratedEntry.op === "create") &&
+            !localFile && localRenameFile && localRenameFile.renamedTo) {
+            hydratedEntry.path = localRenameFile.renamedTo;
+            localFile = state.files[hydratedEntry.path];
+          }
+
+          // Spec §3 delete-vs-modify: check outbox for pending local deletes
+          if ((hydratedEntry.op === "modify" || hydratedEntry.op === "create") &&
+            !localFile && state.outbox) {
+            const pendingDelete = state.outbox.find(
+              (e: any) => e.op === "delete" && e.path === hydratedEntry.path && e.status !== "committed"
+            );
+            if (pendingDelete) {
+              // Local deleted, remote modified — restore with conflict marker
+              this.lastSyncHadConflicts = true;
+              await this.resolveDeleteModifyConflict(
+                { path: hydratedEntry.path, content: pendingDelete.content },
+                hydratedEntry
+              );
+              continue;
+            }
+          }
 
           if ((hydratedEntry.op === "modify" || hydratedEntry.op === "create") &&
             localFile && localFile.blobHash && localFile.blobHash !== hydratedEntry.blobHash) {
