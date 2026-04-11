@@ -21,10 +21,18 @@ export async function pullRemoteOperations(input: PullRemoteOperationsInput): Pr
     input.settings
   );
   await input.applyRemoteOperations(remoteOperations);
-  const remoteHeads = await input.backend.getRemoteHeads();
-  // Reload state to pick up file tracking changes from applyRemoteOperations
+
+  // Spec §3: advance cursors only to the ops actually applied, not to latest remote heads.
+  // Deriving heads from fetched ops prevents skipping ops that arrive during pull.
+  const appliedHeads: Record<string, number> = { ...(input.state.cursorByDevice || {}) };
+  for (const op of remoteOperations) {
+    if (op.device && typeof op.seq === "number") {
+      appliedHeads[op.device] = Math.max(appliedHeads[op.device] || 0, op.seq);
+    }
+  }
+
   const freshState = await input.stateStore.load();
-  let state = updateCursorVector(freshState, remoteHeads);
+  let state = updateCursorVector(freshState, appliedHeads);
   await input.stateStore.save(state);
   await input.backend.writeCursor(input.deviceId, state.cursorByDevice);
   return {

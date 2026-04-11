@@ -762,9 +762,9 @@ export class GoogleDriveClient {
     }
 
     for (const file of patch.files ?? []) {
-      // Version-based optimistic lock: if expectedVersion is provided and the
-      // manifest has already advanced past it, signal a conflict (spec §2)
-      if (typeof file.expectedVersion === "number" && file.op !== "delete") {
+      // Version-based optimistic lock: if expectedVersion is provided,
+      // signal a conflict when the manifest has advanced past it (spec §2)
+      if (typeof file.expectedVersion === "number") {
         const currentRecord = manifest.files[file.path];
         if (currentRecord && typeof currentRecord.version === "number" &&
             currentRecord.version > file.expectedVersion) {

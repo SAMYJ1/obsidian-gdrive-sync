@@ -1,6 +1,7 @@
 export const BUILT_IN_IGNORE_PATHS: string[] = [
   ".obsidian/plugins/obsidian-gdrive-sync/runtime-state.json",
   ".obsidian/plugins/obsidian-gdrive-sync/data.json",
+  ".obsidian/plugins/obsidian-gdrive-sync/outbox.json",
   ".obsidian/workspace.json",
   ".obsidian/workspace-mobile.json",
   ".trash/**",

@@ -73,6 +73,7 @@ export async function coldStart(options: {
     // If any producer's opsHead < snapshotSeqs, re-read manifest (retry loop)
     let manifestRetries = 0;
     const maxManifestRetries = 5;
+    let coherentCutValidated = false;
     while (manifestRetries < maxManifestRetries) {
       const freshManifest = await backend.readManifest();
       const freshHeads = buildTargetHeads(freshManifest);
@@ -85,10 +86,34 @@ export async function coldStart(options: {
       }
       if (allCaughtUp) {
         Object.assign(targetHeads, freshHeads);
+        coherentCutValidated = true;
         break;
       }
       manifestRetries++;
       await new Promise((resolve) => setTimeout(resolve, 500 * manifestRetries));
+    }
+
+    // If coherent cut could not be validated, skip snapshot and retry outer loop
+    if (!coherentCutValidated) {
+      if (attempt < maxAttempts - 1) {
+        continue;
+      }
+      // Final attempt exhausted — fall back to pure op-log replay
+      console.warn("obsidian-gdrive-sync: cold start coherent cut unverifiable, falling back to pure op-log replay");
+      let state = normalizeLocalState(await stateStore.load());
+      state = { ...state, files: {} };
+      await stateStore.save(state);
+      const allOps = await backend.getPendingRemoteOperations({}, settings);
+      const replayHeads = buildTargetHeads(await backend.readManifest());
+      const replayable = filterOperationsToTargetHeads(allOps, replayHeads);
+      await applyRemoteOperations(replayable);
+      state = normalizeLocalState(await stateStore.load());
+      state = updateCursorVector(state, replayHeads);
+      await stateStore.save(state);
+      if (backend && typeof backend.writeCursor === "function") {
+        await backend.writeCursor(deviceId, replayHeads);
+      }
+      return { snapshotMeta: null, targetHeads: replayHeads, replayedOperations: replayable };
     }
 
     const rawSnapshotFiles = await backend.downloadSnapshot(snapshotMetaBefore, settings);
