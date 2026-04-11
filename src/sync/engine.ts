@@ -617,7 +617,9 @@ export class SyncEngine {
 
           if ((hydratedEntry.op === "modify" || hydratedEntry.op === "create") &&
             localFile && localFile.blobHash && localFile.blobHash !== hydratedEntry.blobHash) {
-            const localChangedFromBase = hydratedEntry.parentBlobHashes &&
+            // Spec §2: verify fileId match — path reuse by different file should not trigger conflict
+            const fileIdMatches = !hydratedEntry.fileId || !localFile.fileId || hydratedEntry.fileId === localFile.fileId;
+            const localChangedFromBase = fileIdMatches && hydratedEntry.parentBlobHashes &&
               hydratedEntry.parentBlobHashes.length > 0 &&
               localFile.blobHash !== hydratedEntry.parentBlobHashes[0];
 
@@ -662,8 +664,10 @@ export class SyncEngine {
           }
 
           if (hydratedEntry.op === "delete" && localFile && localFile.blobHash) {
+            // Spec §2: verify fileId match for delete — path reuse means different file
+            const deleteFileIdMatches = !hydratedEntry.fileId || !localFile.fileId || hydratedEntry.fileId === localFile.fileId;
             const remoteParent = hydratedEntry.parentBlobHashes && hydratedEntry.parentBlobHashes[0];
-            if (remoteParent && localFile.blobHash !== remoteParent) {
+            if (deleteFileIdMatches && remoteParent && localFile.blobHash !== remoteParent) {
               this.lastSyncHadConflicts = true;
               await this.resolveDeleteModifyConflict(localFile, hydratedEntry);
               continue;

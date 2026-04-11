@@ -790,6 +790,11 @@ export class GoogleDriveClient {
       }
 
       if (file.op === "delete") {
+        // Spec §2: verify fileId before deleting — path reuse by different file should not be deleted
+        const currentRecord = manifest.files[file.path];
+        if (currentRecord && file.fileId && currentRecord.fileId && currentRecord.fileId !== file.fileId) {
+          continue; // Different file at same path — skip this delete
+        }
         delete manifest.files[file.path];
       } else if (file.op === "rename" && file.newPath) {
         const previousRecord = manifest.files[file.path] ?? { fileId: file.newPath };
