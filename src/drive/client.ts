@@ -186,6 +186,7 @@ export class GoogleDriveClient {
   private readonly resumableUploadThresholdBytes: number;
   private manifestETag: string | null = null;
   private manifestFileId: string | null = null;
+  private folderIdCache: Map<string, string> = new Map();
 
   constructor(options: GoogleDriveClientOptions) {
     this.fetchImpl = options.fetchImpl ?? (globalThis.fetch as unknown as FetchImpl).bind(globalThis);
@@ -380,13 +381,18 @@ export class GoogleDriveClient {
   }
 
   async ensureRootFolder(): Promise<DriveFileRecord> {
+    const cached = this.folderIdCache.get("__root__");
+    if (cached) {
+      return { id: cached, name: this.rootFolderName } as DriveFileRecord;
+    }
     const existing = await this.listFiles(
       `mimeType='application/vnd.google-apps.folder' and name='${this.rootFolderName}' and trashed=false`
     );
     if (existing.length > 0) {
+      this.folderIdCache.set("__root__", existing[0].id);
       return existing[0];
     }
-    return this.requestJson("POST", "/drive/v3/files", {
+    const created = await this.requestJson("POST", "/drive/v3/files", {
       headers: {
         "Content-Type": "application/json"
       },
@@ -398,15 +404,25 @@ export class GoogleDriveClient {
         }
       })
     });
+    this.folderIdCache.set("__root__", created.id);
+    return created;
   }
 
   async ensureVaultFolder(): Promise<DriveFileRecord> {
+    const cacheKey = `__vault__`;
+    const cached = this.folderIdCache.get(cacheKey);
+    if (cached) {
+      return { id: cached, name: this.vaultName } as DriveFileRecord;
+    }
     const existing = await this.findByManagedLogicalPath(this.vaultName);
     if (existing) {
+      this.folderIdCache.set(cacheKey, existing.id);
       return existing;
     }
     const root = await this.ensureRootFolder();
-    return this.createFolder(this.vaultName, root.id, this.vaultName, "vault-root");
+    const created = await this.createFolder(this.vaultName, root.id, this.vaultName, "vault-root");
+    this.folderIdCache.set(cacheKey, created.id);
+    return created;
   }
 
   async findByLogicalPath(logicalPath: string): Promise<DriveFileRecord | null> {
@@ -461,11 +477,18 @@ export class GoogleDriveClient {
 
     for (const part of parts) {
       currentManagedPath = `${currentManagedPath}/${part}`;
+      const cached = this.folderIdCache.get(currentManagedPath);
+      if (cached) {
+        currentParentId = cached;
+        continue;
+      }
       const existing = await this.findByManagedLogicalPath(currentManagedPath);
       if (existing) {
+        this.folderIdCache.set(currentManagedPath, existing.id);
         currentParentId = existing.id;
       } else {
         const created = await this.createFolder(part, currentParentId, currentManagedPath);
+        this.folderIdCache.set(currentManagedPath, created.id);
         currentParentId = created.id;
       }
     }

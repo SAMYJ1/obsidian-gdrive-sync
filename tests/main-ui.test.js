@@ -54,6 +54,7 @@ module.exports = (async function () {
   pollForChangesCalls = 0;
   plugin.settings = { enableAutoSync: true };
   plugin.isColdStartCandidate = () => false;
+  let savedToken = null;
   plugin.stateStore = {
     async load() {
       return {
@@ -67,13 +68,20 @@ module.exports = (async function () {
           }
         }
       };
-    }
+    },
+    async save(s) { savedToken = s.changesPageToken; }
   };
+  plugin.backend = {
+    async getStartPageToken() { return "fresh-token"; }
+  };
+  plugin.writeDebugLog = () => {};
+  plugin.lastSyncCompletedAt = 0;
 
   await plugin.runInitialSyncIfNeeded();
 
   assert.strictEqual(runSyncNowCalls, 0, "initial load should not force a full sync when local state is already initialized");
-  assert.strictEqual(pollForChangesCalls, 1, "initial load should silently poll for remote updates before deciding whether to sync");
+  assert.strictEqual(pollForChangesCalls, 0, "initial load should refresh token, not poll for stale changes");
+  assert.strictEqual(savedToken, "fresh-token", "initial load should refresh the changes page token");
 
   const classSet = new Set();
   plugin.ribbonIconEl = {

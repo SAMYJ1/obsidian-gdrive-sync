@@ -6,9 +6,9 @@ const {
 
 assert(
   BUILT_IN_IGNORE_PATHS.includes(
-    ".obsidian/plugins/obsidian-gdrive-sync/runtime-state.json"
+    ".obsidian/plugins/obsidian-gdrive-sync/**"
   ),
-  "runtime-state.json must be a built-in ignored path"
+  "plugin directory must be a built-in ignored path"
 );
 
 assert.strictEqual(

@@ -1,7 +1,5 @@
 export const BUILT_IN_IGNORE_PATHS: string[] = [
-  ".obsidian/plugins/obsidian-gdrive-sync/runtime-state.json",
-  ".obsidian/plugins/obsidian-gdrive-sync/data.json",
-  ".obsidian/plugins/obsidian-gdrive-sync/outbox.json",
+  ".obsidian/plugins/obsidian-gdrive-sync/**",
   ".obsidian/workspace.json",
   ".obsidian/workspace-mobile.json",
   ".trash/**",
@@ -35,7 +33,9 @@ function matchesPattern(filePath: string, pattern: string): boolean {
 
 export function isIgnoredPath(filePath: string, extraPatterns: string[] = []): boolean {
   const patterns = BUILT_IN_IGNORE_PATHS.concat(extraPatterns || []);
-  let ignored = false;
+  // Default: ignore files in hidden directories/dotfiles.
+  // Any path segment starting with "." is hidden by convention.
+  let ignored = filePath.split("/").some(s => s.startsWith("."));
   patterns.forEach((pattern) => {
     if (!pattern) {
       return;

@@ -263,7 +263,7 @@ export class SyncEngine {
   private readonly vaultAdapter: any;
   private readonly notifyUser: ((message: string) => void) | null;
   private lastSyncHadConflicts = false;
-  private fullSnapshotNeeded = true;
+  private fullSnapshotNeeded = false;
 
   constructor(options: {
     deviceId: string;
@@ -298,16 +298,24 @@ export class SyncEngine {
     }
 
     let state = await this.loadState();
+    const existingFile = state.files[change.path];
+    const parentBlobHash = existingFile && existingFile.blobHash;
+
+    // Compute hash early to check for no-op changes.
+    const blobHash = change.op === "delete" ? undefined : (change.blobHash || await computeBlobHash(change.content));
+
+    // Skip if content hasn't actually changed — prevents no-op entries
+    // from vault reload events on startup.
+    if (change.op !== "delete" && existingFile && blobHash && existingFile.blobHash === blobHash) {
+      return null;
+    }
+
     const reservedState = reserveOperation(state);
     // Spec §3: Step 1 — persist reserved entry durably before binding
     await this.stateStore.save(reservedState);
     const reservedEntry = reservedState.outbox[reservedState.outbox.length - 1];
-    const existingFile = state.files[change.path];
-    const parentBlobHash = existingFile && existingFile.blobHash;
     const fileId = change.fileId || (existingFile && existingFile.fileId) || createFileId();
     const nextVersion = change.op === "create" ? 1 : ((existingFile && existingFile.version) || 0) + 1;
-    // Spec: delete ops carry no blobHash
-    const blobHash = change.op === "delete" ? undefined : (change.blobHash || await computeBlobHash(change.content));
 
     state = bindReservedOperation(reservedState, reservedEntry.seq, {
       device: this.deviceId,
@@ -396,6 +404,7 @@ export class SyncEngine {
 
     if (await this.shouldBootstrapLocalVault(state, settings)) {
       await this.bootstrapLocalVault(state, settings);
+      this.fullSnapshotNeeded = true;
       state = await this.loadState();
     }
 
@@ -408,6 +417,7 @@ export class SyncEngine {
         vaultAdapter: this.vaultAdapter,
         applyRemoteOperations: this.applyRemoteOperations.bind(this)
       });
+      this.fullSnapshotNeeded = true;
       state = await this.loadState();
     }
 

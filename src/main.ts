@@ -85,6 +85,7 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
   pollIntervalHandle: any;
   syncPhase: "idle" | "pushing" | "pulling" | "merging" | "finalizing" = "idle";
   pendingSyncTrigger = false;
+  private lastSyncCompletedAt = 0;
   statusBarEl: any;
   ribbonIconEl: any;
 
@@ -270,6 +271,12 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
 
   async pollForChanges(): Promise<void> {
     if (this.syncPhase !== "idle") return;
+    // Skip poll if sync completed very recently — Drive API has eventual
+    // consistency, so our own writes may still appear as "new changes".
+    const sinceLast = Date.now() - this.lastSyncCompletedAt;
+    if (this.lastSyncCompletedAt > 0 && sinceLast < 30_000) {
+      return;
+    }
     try {
       let state = await this.stateStore.load();
       if (!state.changesPageToken) {
@@ -281,15 +288,17 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
           await this.runSyncNow();
           return;
         }
+        return;
       }
       const result = await this.backend.listChanges(state.changesPageToken);
+      // Only trigger sync for changes that belong to this vault.
+      // Ignore `change.removed` without vault context — it fires for any
+      // trashed file in Drive (including our own snapshot/cursor writes).
       const hasChanges = (result.changes || []).some((change: any) => {
-        if (change.removed) {
-          return true;
-        }
         const props = change.file && change.file.appProperties;
         return props && props.vault === this.app.vault.getName();
       });
+      // Always advance the page token regardless of whether we sync.
       if (result.newStartPageToken || result.nextPageToken) {
         state = await this.stateStore.load();
         state = updateChangesPageToken(state, result.newStartPageToken || result.nextPageToken);
@@ -301,8 +310,7 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
       }
     } catch (error) {
       this.writeDebugLog("poll-error", error);
-      console.warn("obsidian-gdrive-sync: poll failed, falling back to full sync", error);
-      await this.runSyncNow();
+      console.warn("obsidian-gdrive-sync: poll failed, will retry on next interval", error);
     }
   }
 
@@ -365,10 +373,23 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
         }
       });
       this.writeDebugLog("sync-complete", "sync cycle finished");
+      // After sync, refresh the changes page token so the next poll
+      // starts from after our own Drive writes and won't re-trigger sync.
+      // Wait briefly for Drive's eventual consistency to settle.
+      try {
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        const freshToken = await this.backend.getStartPageToken();
+        let postSyncState = await this.stateStore.load();
+        postSyncState = updateChangesPageToken(postSyncState, freshToken);
+        await this.stateStore.save(postSyncState);
+      } catch (tokenError) {
+        console.warn("obsidian-gdrive-sync: failed to refresh page token after sync", tokenError);
+      }
     } catch (syncError: unknown) {
       this.writeDebugLog("sync-error", syncError);
     } finally {
       this.syncPhase = "idle";
+      this.lastSyncCompletedAt = Date.now();
       this.updateStatusBar();
       if (this.pendingSyncTrigger) {
         this.pendingSyncTrigger = false;
@@ -386,7 +407,23 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
       await this.runSyncNow();
       return;
     }
-    await this.handleForegroundSyncTrigger();
+    // On startup, silently refresh the changes page token instead of
+    // polling for changes.  The Drive changes API has eventual consistency
+    // so our own writes from the previous session may still appear as
+    // "new changes" — triggering an unnecessary sync cycle.  By refreshing
+    // the token now and only responding to FUTURE changes, we avoid the
+    // startup sync loop while still catching real remote edits on the
+    // next regular poll interval.
+    try {
+      const freshToken = await this.backend.getStartPageToken();
+      let updated = await this.stateStore.load();
+      updated = updateChangesPageToken(updated, freshToken);
+      await this.stateStore.save(updated);
+      this.lastSyncCompletedAt = Date.now();
+      this.writeDebugLog("startup", "refreshed page token, skipping initial poll");
+    } catch (err) {
+      this.writeDebugLog("startup-token-error", err);
+    }
   }
 
   isColdStartCandidate(state: any): boolean {
