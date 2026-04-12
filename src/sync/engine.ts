@@ -407,9 +407,15 @@ export class SyncEngine {
     if (await this.shouldBootstrapLocalVault(state, settings)) {
       onPhaseChange("pushing");
       await this.bootstrapLocalVault(state, settings);
-      // Bootstrap already uploaded snapshot + manifest; skip normal push/pull/finalize
-      onPhaseChange("finalizing");
+      // Clear any outbox entries created by vault watcher during bootstrap.
+      // Bootstrap has already uploaded everything directly to vault/.
       state = await this.loadState();
+      if (state.outbox.length > 0) {
+        console.log(`obsidian-gdrive-sync: clearing ${state.outbox.length} spurious outbox entries from vault watcher`);
+        state = normalizeLocalState({ ...state, outbox: [] });
+        await this.stateStore.save(state);
+      }
+      onPhaseChange("finalizing");
       return { state, remoteOperations: [] };
     }
 
@@ -764,15 +770,24 @@ export class SyncEngine {
 
     // Upload files to vault/ snapshot layer (concurrent, no blobs)
     console.log(`obsidian-gdrive-sync: bootstrap — uploading ${snapshotPayload.length} files to vault/`);
-    await this.backend.publishSnapshot({
-      snapshotPublishMode: settings.snapshotPublishMode,
-      nextGenerationId: `gen-${this.now()}`,
-      snapshotSeqs: { [this.deviceId]: 0 },
-      files: snapshotPayload,
-      changedFiles: snapshotPayload,
-      deletedFiles: [],
-      renamedFiles: []
-    });
+    if (typeof this.backend.setBootstrapMode === "function") {
+      this.backend.setBootstrapMode(true);
+    }
+    try {
+      await this.backend.publishSnapshot({
+        snapshotPublishMode: settings.snapshotPublishMode,
+        nextGenerationId: `gen-${this.now()}`,
+        snapshotSeqs: { [this.deviceId]: 0 },
+        files: snapshotPayload,
+        changedFiles: snapshotPayload,
+        deletedFiles: [],
+        renamedFiles: []
+      });
+    } finally {
+      if (typeof this.backend.setBootstrapMode === "function") {
+        this.backend.setBootstrapMode(false);
+      }
+    }
 
     // Write manifest with all file entries + device registration
     console.log(`obsidian-gdrive-sync: bootstrap — writing manifest with ${manifestFiles.length} entries`);

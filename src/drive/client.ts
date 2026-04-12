@@ -188,7 +188,13 @@ export class GoogleDriveClient {
   private manifestFileId: string | null = null;
   private folderIdCache: Map<string, string> = new Map();
   private folderInflight: Map<string, Promise<string>> = new Map();
+  private segmentInflight: Map<string, Promise<string>> = new Map();
   private fileIdCache: Map<string, string> = new Map();
+  private _bootstrapMode = false;
+
+  setBootstrapMode(enabled: boolean): void {
+    this._bootstrapMode = enabled;
+  }
 
   constructor(options: GoogleDriveClientOptions) {
     this.fetchImpl = options.fetchImpl ?? (globalThis.fetch as unknown as FetchImpl).bind(globalThis);
@@ -222,9 +228,43 @@ export class GoogleDriveClient {
     return normalized.slice(prefix.length);
   }
 
+  private safeLogicalPathValue(managedLogicalPath: string): string {
+    const keyName = "logicalPath";
+    const encoder = new TextEncoder();
+    const keyBytes = encoder.encode(keyName).length;
+    const valueBytes = encoder.encode(managedLogicalPath).length;
+    const maxValueBytes = 124 - keyBytes;
+
+    if (valueBytes <= maxValueBytes) {
+      return managedLogicalPath;
+    }
+
+    // DJB2 hash for disambiguation of truncated paths
+    let hash = 5381;
+    for (let i = 0; i < managedLogicalPath.length; i++) {
+      hash = ((hash << 5) + hash + managedLogicalPath.charCodeAt(i)) >>> 0;
+    }
+    const hashSuffix = hash.toString(16).padStart(8, "0");
+
+    // Reserve 9 bytes for "#" + 8-char hex hash
+    const maxPrefixBytes = maxValueBytes - 9;
+
+    // Build prefix char by char to avoid splitting multi-byte chars
+    let prefix = "";
+    let byteLen = 0;
+    for (const char of managedLogicalPath) {
+      const charBytes = encoder.encode(char).length;
+      if (byteLen + charBytes > maxPrefixBytes) break;
+      prefix += char;
+      byteLen += charBytes;
+    }
+
+    return `${prefix}#${hashSuffix}`;
+  }
+
   private buildManagedAppProperties(managedLogicalPath: string, kind: string): Record<string, string> {
     return {
-      logicalPath: managedLogicalPath,
+      logicalPath: this.safeLogicalPathValue(managedLogicalPath),
       kind,
       vault: this.vaultName
     };
@@ -248,11 +288,22 @@ export class GoogleDriveClient {
         Authorization: `Bearer ${accessToken}`
       };
       await this.rateLimiter.acquire(1);
-      const response = await this.fetchImpl(`${this.baseUrl}${resourcePath}${toQueryString(options?.query)}`, {
-        method,
-        headers,
-        body: options?.body
-      });
+      let response: DriveResponse;
+      try {
+        response = await this.fetchImpl(`${this.baseUrl}${resourcePath}${toQueryString(options?.query)}`, {
+          method,
+          headers,
+          body: options?.body
+        });
+      } catch (networkError: any) {
+        // Network-level failures (Failed to fetch, ERR_CONNECTION_CLOSED, etc.)
+        lastError = networkError;
+        if (attempt >= maxAttempts) throw networkError;
+        const delay = 1000 * Math.pow(2, attempt - 1);
+        console.log(`obsidian-gdrive-sync: network error on ${method} ${resourcePath}, retry ${attempt}/${maxAttempts} in ${delay}ms`);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        continue;
+      }
       if (response.ok) {
         return response;
       }
@@ -469,8 +520,10 @@ export class GoogleDriveClient {
     if (cachedId) {
       return { id: cachedId, appProperties: { logicalPath: managedLogicalPath } } as DriveFileRecord;
     }
+    // Use safeLogicalPathValue so we search by the same (possibly truncated+hashed) value stored in appProperties
+    const safeValue = this.safeLogicalPathValue(managedLogicalPath);
     const files = await this.listFiles(
-      `appProperties has { key='logicalPath' and value='${managedLogicalPath}' } and trashed=false`
+      `appProperties has { key='logicalPath' and value='${safeValue}' } and trashed=false`
     );
     const found = files[0] ?? null;
     if (found) {
@@ -540,14 +593,34 @@ export class GoogleDriveClient {
         currentParentId = cached;
         continue;
       }
-      const existing = await this.findByManagedLogicalPath(currentManagedPath);
-      if (existing) {
-        this.folderIdCache.set(currentManagedPath, existing.id);
-        currentParentId = existing.id;
-      } else {
-        const created = await this.createFolder(part, currentParentId, currentManagedPath);
-        this.folderIdCache.set(currentManagedPath, created.id);
-        currentParentId = created.id;
+
+      // Dedup concurrent creation of the same folder segment across workers
+      const inflight = this.segmentInflight.get(currentManagedPath);
+      if (inflight) {
+        currentParentId = await inflight;
+        continue;
+      }
+
+      const parentForSegment = currentParentId;
+      const managedPath = currentManagedPath;
+      const segmentPromise = (async () => {
+        if (!this._bootstrapMode) {
+          const existing = await this.findByManagedLogicalPath(managedPath);
+          if (existing) {
+            this.folderIdCache.set(managedPath, existing.id);
+            return existing.id;
+          }
+        }
+        const created = await this.createFolder(part, parentForSegment, managedPath);
+        this.folderIdCache.set(managedPath, created.id);
+        return created.id;
+      })();
+
+      this.segmentInflight.set(currentManagedPath, segmentPromise);
+      try {
+        currentParentId = await segmentPromise;
+      } finally {
+        this.segmentInflight.delete(currentManagedPath);
       }
     }
     return currentParentId;
@@ -565,7 +638,10 @@ export class GoogleDriveClient {
     const parentId = parentPath ? await this.ensureFolder(parentPath) : (await this.ensureVaultFolder()).id;
     // For manifest.json, use cached file ID to avoid unreliable appProperties search
     let existing: DriveFileRecord | null;
-    if (logicalPath === "manifest.json" && this.manifestFileId) {
+    if (this._bootstrapMode) {
+      // During bootstrap, Drive is empty — skip the expensive findByLogicalPath search
+      existing = null;
+    } else if (logicalPath === "manifest.json" && this.manifestFileId) {
       existing = { id: this.manifestFileId, name: "manifest.json" } as DriveFileRecord;
     } else {
       existing = await this.findByLogicalPath(logicalPath);

@@ -11,15 +11,39 @@ export class GoogleDriveBackend {
     this.concurrency = options.concurrency ?? 5;
   }
 
+  setBootstrapMode(enabled: boolean): void {
+    if (typeof this.driveClient.setBootstrapMode === "function") {
+      this.driveClient.setBootstrapMode(enabled);
+    }
+  }
+
   private async runConcurrent<T>(items: T[], fn: (item: T) => Promise<void>): Promise<void> {
-    const queue = items.slice();
-    const workers = Array.from({ length: Math.min(this.concurrency, queue.length) }, async () => {
-      while (queue.length > 0) {
-        const item = queue.shift()!;
-        await fn(item);
+    let remaining = items.slice();
+    const maxRounds = 3;
+    for (let round = 0; round < maxRounds; round++) {
+      const failed: T[] = [];
+      const queue = remaining.slice();
+      const workers = Array.from({ length: Math.min(this.concurrency, queue.length) }, async () => {
+        while (queue.length > 0) {
+          const item = queue.shift()!;
+          try {
+            await fn(item);
+          } catch (err) {
+            console.log(`obsidian-gdrive-sync: runConcurrent item failed (round ${round + 1}), will retry`);
+            failed.push(item);
+          }
+        }
+      });
+      await Promise.all(workers);
+      if (failed.length === 0) return;
+      if (round + 1 >= maxRounds) {
+        throw new Error(`runConcurrent: ${failed.length} items still failing after ${maxRounds} rounds`);
       }
-    });
-    await Promise.all(workers);
+      remaining = failed;
+      // Back off before retrying failed items
+      await new Promise((resolve) => setTimeout(resolve, 2000 * (round + 1)));
+      console.log(`obsidian-gdrive-sync: retrying ${failed.length} failed items (round ${round + 2})`);
+    }
   }
 
   async uploadBlob(change: any): Promise<any> {
