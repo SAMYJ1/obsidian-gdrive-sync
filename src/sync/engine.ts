@@ -405,9 +405,12 @@ export class SyncEngine {
     await this.stateStore.save(state);
 
     if (await this.shouldBootstrapLocalVault(state, settings)) {
+      onPhaseChange("pushing");
       await this.bootstrapLocalVault(state, settings);
-      this.fullSnapshotNeeded = true;
+      // Bootstrap already uploaded snapshot + manifest; skip normal push/pull/finalize
+      onPhaseChange("finalizing");
       state = await this.loadState();
+      return { state, remoteOperations: [] };
     }
 
     if (await this.shouldColdStart(state, settings)) {
@@ -717,20 +720,78 @@ export class SyncEngine {
 
   async bootstrapLocalVault(state: any, settings: any): Promise<void> {
     const snapshotFiles = await this.vaultAdapter.listSnapshotFiles(settings.ignorePatterns || []);
-    const queuedPaths = new Set(
-      normalizeLocalState(state).outbox.map((entry: any) => entry.newPath || entry.path).filter(Boolean)
-    );
+    console.log(`obsidian-gdrive-sync: bootstrap — ${snapshotFiles.length} files to upload directly to vault/`);
+
+    // Build manifest entries + snapshot payload (no blobs, no op-log)
+    const manifestFiles: Array<Record<string, unknown>> = [];
+    const snapshotPayload: Array<{ path: string; content: string | Uint8Array }> = [];
+    let state_ = await this.loadState();
+
     for (const file of snapshotFiles) {
-      if (!file.path || queuedPaths.has(file.path)) {
-        continue;
-      }
-      await this.trackLocalChange({
+      if (!file.path) continue;
+      const blobHash = await computeBlobHash(file.content);
+      const fileId = createFileId();
+      const now = this.now();
+
+      manifestFiles.push({
         path: file.path,
         op: "create",
+        fileId,
+        blobHash,
+        size: typeof file.content === "string" ? file.content.length : (file.content as Uint8Array).length,
+        mtime: now,
+        lastModifiedBy: this.deviceId,
+        updatedAt: now,
+        version: 1,
+        seq: 0
+      });
+
+      snapshotPayload.push({
+        path: `vault/${file.path}`,
         content: file.content
       });
-      queuedPaths.add(file.path);
+
+      state_ = updateTrackedFile(state_, {
+        path: file.path,
+        fileId,
+        version: 1,
+        blobHash,
+        parentBlobHashes: [],
+        lastModifiedBy: this.deviceId,
+        updatedAt: now
+      });
     }
+
+    // Upload files to vault/ snapshot layer (concurrent, no blobs)
+    console.log(`obsidian-gdrive-sync: bootstrap — uploading ${snapshotPayload.length} files to vault/`);
+    await this.backend.publishSnapshot({
+      snapshotPublishMode: settings.snapshotPublishMode,
+      nextGenerationId: `gen-${this.now()}`,
+      snapshotSeqs: { [this.deviceId]: 0 },
+      files: snapshotPayload,
+      changedFiles: snapshotPayload,
+      deletedFiles: [],
+      renamedFiles: []
+    });
+
+    // Write manifest with all file entries + device registration
+    console.log(`obsidian-gdrive-sync: bootstrap — writing manifest with ${manifestFiles.length} entries`);
+    await this.backend.commitManifest({
+      deviceId: this.deviceId,
+      files: manifestFiles
+    });
+
+    // Write cursor
+    const cursorVector = { [this.deviceId]: 0 };
+    if (typeof this.backend.writeCursor === "function") {
+      await this.backend.writeCursor(this.deviceId, cursorVector);
+    }
+
+    // Update local state: files tracked, cursor set, no outbox entries
+    state_ = updateCursorVector(state_, cursorVector);
+    await this.stateStore.save(state_);
+
+    console.log(`obsidian-gdrive-sync: bootstrap — complete, ${snapshotFiles.length} files synced`);
   }
 
   async applyRemoteOperations(entries: any[]): Promise<void> {

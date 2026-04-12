@@ -188,6 +188,7 @@ export class GoogleDriveClient {
   private manifestFileId: string | null = null;
   private folderIdCache: Map<string, string> = new Map();
   private folderInflight: Map<string, Promise<string>> = new Map();
+  private fileIdCache: Map<string, string> = new Map();
 
   constructor(options: GoogleDriveClientOptions) {
     this.fetchImpl = options.fetchImpl ?? (globalThis.fetch as unknown as FetchImpl).bind(globalThis);
@@ -463,10 +464,19 @@ export class GoogleDriveClient {
   }
 
   async findByManagedLogicalPath(managedLogicalPath: string): Promise<DriveFileRecord | null> {
+    // Check session cache first to avoid eventual-consistency duplicates
+    const cachedId = this.fileIdCache.get(managedLogicalPath);
+    if (cachedId) {
+      return { id: cachedId, appProperties: { logicalPath: managedLogicalPath } } as DriveFileRecord;
+    }
     const files = await this.listFiles(
       `appProperties has { key='logicalPath' and value='${managedLogicalPath}' } and trashed=false`
     );
-    return files[0] ?? null;
+    const found = files[0] ?? null;
+    if (found) {
+      this.fileIdCache.set(managedLogicalPath, found.id);
+    }
+    return found;
   }
 
   async listManagedFiles(): Promise<DriveFileRecord[]> {
@@ -599,7 +609,7 @@ export class GoogleDriveClient {
       });
     }
 
-    return this.requestJson("POST", "/upload/drive/v3/files", {
+    const created = await this.requestJson("POST", "/upload/drive/v3/files", {
       query: {
         uploadType: "multipart",
         fields: "id,name,appProperties"
@@ -609,6 +619,11 @@ export class GoogleDriveClient {
       },
       body
     });
+    // Cache new file ID to prevent duplicate creation from eventual consistency
+    if (created?.id) {
+      this.fileIdCache.set(this.toManagedLogicalPath(logicalPath), created.id);
+    }
+    return created;
   }
 
   toContentBuffer(content: string | Uint8Array | Buffer): Buffer {
@@ -707,7 +722,11 @@ export class GoogleDriveClient {
           error.status = uploadResponse.status;
           throw error;
         }
-        return uploadResponse.status === 204 ? {} : uploadResponse.json();
+        const result = uploadResponse.status === 204 ? {} : await uploadResponse.json();
+        if (result?.id && !options.existing) {
+          this.fileIdCache.set(this.toManagedLogicalPath(logicalPath), result.id);
+        }
+        return result;
       }
       // For non-final chunks, Google responds with 308 Resume Incomplete
       if (uploadResponse.status !== 308 && !uploadResponse.ok) {
