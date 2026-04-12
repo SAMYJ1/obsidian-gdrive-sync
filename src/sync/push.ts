@@ -16,7 +16,11 @@ export interface PushOutboxEntryInput {
   };
 }
 
-export async function pushOutboxEntry(input: PushOutboxEntryInput): Promise<any> {
+/**
+ * Upload blob + append op for a single entry (does NOT commit manifest).
+ * Returns the entry status after publish ("published" or unchanged).
+ */
+export async function publishOutboxEntry(input: PushOutboxEntryInput): Promise<any> {
   let state = input.state;
   const entry = input.entry;
 
@@ -56,6 +60,17 @@ export async function pushOutboxEntry(input: PushOutboxEntryInput): Promise<any>
     await input.stateStore.save(state);
   }
 
+  return state;
+}
+
+/**
+ * Push a single entry: publish (blob + op) then commit manifest.
+ * Used for incremental syncs with small outbox counts.
+ */
+export async function pushOutboxEntry(input: PushOutboxEntryInput): Promise<any> {
+  let state = await publishOutboxEntry(input);
+  const entry = input.entry;
+
   // For published entries, check if the manifest already has this entry committed
   // (e.g., via reconciliation). If so, skip directly to committed.
   if (entry.status === "published" && typeof input.backend.readManifest === "function") {
@@ -63,7 +78,6 @@ export async function pushOutboxEntry(input: PushOutboxEntryInput): Promise<any>
       const manifest = await input.backend.readManifest();
       const device = manifest?.devices?.[input.deviceId];
       if (device && typeof device.opsHead === "number" && device.opsHead >= entry.seq) {
-        // Manifest already reflects this entry — skip to committed
         state = markOperationCommitted(state, entry.seq);
         await input.stateStore.save(state);
         return state;

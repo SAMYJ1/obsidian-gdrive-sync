@@ -291,13 +291,35 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
         return;
       }
       const result = await this.backend.listChanges(state.changesPageToken);
-      // Only trigger sync for changes that belong to this vault.
-      // Ignore `change.removed` without vault context — it fires for any
-      // trashed file in Drive (including our own snapshot/cursor writes).
-      const hasChanges = (result.changes || []).some((change: any) => {
+      // Only trigger sync for changes from OTHER devices.
+      // – blobs/ and vault/ (snapshots) are always our own → skip
+      // – ops/live/{deviceId}.jsonl → skip if deviceId is ours
+      // – manifest.json → only relevant when another device wrote it.
+      //   We can't tell the writer from appProperties, so we only trigger
+      //   on manifest if we've also seen at least one foreign op log change.
+      //   (A foreign device always writes its ops AND the manifest.)
+      const vaultPrefix = this.app.vault.getName() + "/";
+      const ownDeviceId = this.localState.deviceId;
+      let seenForeignOps = false;
+      let seenManifest = false;
+      for (const change of result.changes || []) {
         const props = change.file && change.file.appProperties;
-        return props && props.vault === this.app.vault.getName();
-      });
+        if (!props || props.vault !== this.app.vault.getName()) continue;
+        const lp = props.logicalPath || "";
+        const rel = lp.startsWith(vaultPrefix) ? lp.slice(vaultPrefix.length) : lp;
+        if (rel.startsWith("ops/") && ownDeviceId && !rel.includes(ownDeviceId)) {
+          seenForeignOps = true;
+          break; // enough to trigger
+        }
+        if (rel === "manifest.json") {
+          seenManifest = true;
+        }
+      }
+      // Trigger sync only when we see foreign ops.  Manifest-only changes
+      // are ignored because, on a single device, the only manifest writer
+      // is us.  On multi-device, a foreign device always writes ops AND
+      // manifest, so foreign ops alone is sufficient.
+      const hasChanges = seenForeignOps;
       // Always advance the page token regardless of whether we sync.
       if (result.newStartPageToken || result.nextPageToken) {
         state = await this.stateStore.load();
@@ -407,13 +429,19 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
       await this.runSyncNow();
       return;
     }
-    // On startup, silently refresh the changes page token instead of
+    // Cold start / bootstrap: if local state has no tracked files and no
+    // cursor, we need to run a sync to populate from Drive (cold start) or
+    // push local vault to Drive (bootstrap).  Do this immediately rather
+    // than waiting for the poll interval.
+    if (this.isColdStartCandidate(state)) {
+      this.writeDebugLog("startup", "cold start candidate, running initial sync");
+      await this.runSyncNow();
+      return;
+    }
+    // Normal startup: silently refresh the changes page token instead of
     // polling for changes.  The Drive changes API has eventual consistency
     // so our own writes from the previous session may still appear as
-    // "new changes" — triggering an unnecessary sync cycle.  By refreshing
-    // the token now and only responding to FUTURE changes, we avoid the
-    // startup sync loop while still catching real remote edits on the
-    // next regular poll interval.
+    // "new changes" — triggering an unnecessary sync cycle.
     try {
       const freshToken = await this.backend.getStartPageToken();
       let updated = await this.stateStore.load();

@@ -187,6 +187,7 @@ export class GoogleDriveClient {
   private manifestETag: string | null = null;
   private manifestFileId: string | null = null;
   private folderIdCache: Map<string, string> = new Map();
+  private folderInflight: Map<string, Promise<string>> = new Map();
 
   constructor(options: GoogleDriveClientOptions) {
     this.fetchImpl = options.fetchImpl ?? (globalThis.fetch as unknown as FetchImpl).bind(globalThis);
@@ -385,27 +386,43 @@ export class GoogleDriveClient {
     if (cached) {
       return { id: cached, name: this.rootFolderName } as DriveFileRecord;
     }
-    const existing = await this.listFiles(
-      `mimeType='application/vnd.google-apps.folder' and name='${this.rootFolderName}' and trashed=false`
-    );
-    if (existing.length > 0) {
-      this.folderIdCache.set("__root__", existing[0].id);
-      return existing[0];
+    // Deduplicate concurrent calls
+    const inflightKey = "__ensure_root__";
+    const inflight = this.folderInflight.get(inflightKey);
+    if (inflight) {
+      const id = await inflight;
+      return { id, name: this.rootFolderName } as DriveFileRecord;
     }
-    const created = await this.requestJson("POST", "/drive/v3/files", {
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        name: this.rootFolderName,
-        mimeType: "application/vnd.google-apps.folder",
-        appProperties: {
-          kind: "root"
-        }
-      })
-    });
-    this.folderIdCache.set("__root__", created.id);
-    return created;
+    const promise = (async () => {
+      const existing = await this.listFiles(
+        `mimeType='application/vnd.google-apps.folder' and name='${this.rootFolderName}' and trashed=false`
+      );
+      if (existing.length > 0) {
+        this.folderIdCache.set("__root__", existing[0].id);
+        return existing[0].id;
+      }
+      const created = await this.requestJson("POST", "/drive/v3/files", {
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          name: this.rootFolderName,
+          mimeType: "application/vnd.google-apps.folder",
+          appProperties: {
+            kind: "root"
+          }
+        })
+      });
+      this.folderIdCache.set("__root__", created.id);
+      return created.id as string;
+    })();
+    this.folderInflight.set(inflightKey, promise);
+    try {
+      const id = await promise;
+      return { id, name: this.rootFolderName } as DriveFileRecord;
+    } finally {
+      this.folderInflight.delete(inflightKey);
+    }
   }
 
   async ensureVaultFolder(): Promise<DriveFileRecord> {
@@ -414,15 +431,31 @@ export class GoogleDriveClient {
     if (cached) {
       return { id: cached, name: this.vaultName } as DriveFileRecord;
     }
-    const existing = await this.findByManagedLogicalPath(this.vaultName);
-    if (existing) {
-      this.folderIdCache.set(cacheKey, existing.id);
-      return existing;
+    // Deduplicate concurrent calls
+    const inflightKey = "__ensure_vault__";
+    const inflight = this.folderInflight.get(inflightKey);
+    if (inflight) {
+      const id = await inflight;
+      return { id, name: this.vaultName } as DriveFileRecord;
     }
-    const root = await this.ensureRootFolder();
-    const created = await this.createFolder(this.vaultName, root.id, this.vaultName, "vault-root");
-    this.folderIdCache.set(cacheKey, created.id);
-    return created;
+    const promise = (async () => {
+      const existing = await this.findByManagedLogicalPath(this.vaultName);
+      if (existing) {
+        this.folderIdCache.set(cacheKey, existing.id);
+        return existing.id;
+      }
+      const root = await this.ensureRootFolder();
+      const created = await this.createFolder(this.vaultName, root.id, this.vaultName, "vault-root");
+      this.folderIdCache.set(cacheKey, created.id);
+      return created.id as string;
+    })();
+    this.folderInflight.set(inflightKey, promise);
+    try {
+      const id = await promise;
+      return { id, name: this.vaultName } as DriveFileRecord;
+    } finally {
+      this.folderInflight.delete(inflightKey);
+    }
   }
 
   async findByLogicalPath(logicalPath: string): Promise<DriveFileRecord | null> {
@@ -470,6 +503,21 @@ export class GoogleDriveClient {
   }
 
   async ensureFolder(logicalFolderPath: string): Promise<string> {
+    // Deduplicate concurrent calls for the same path to avoid TOCTOU races
+    // where multiple workers create the same folder before the cache is populated.
+    const inflight = this.folderInflight.get(logicalFolderPath);
+    if (inflight) return inflight;
+
+    const promise = this._ensureFolderImpl(logicalFolderPath);
+    this.folderInflight.set(logicalFolderPath, promise);
+    try {
+      return await promise;
+    } finally {
+      this.folderInflight.delete(logicalFolderPath);
+    }
+  }
+
+  private async _ensureFolderImpl(logicalFolderPath: string): Promise<string> {
     const vaultRoot = await this.ensureVaultFolder();
     const parts = logicalFolderPath.split("/").filter(Boolean);
     let currentParentId = vaultRoot.id;

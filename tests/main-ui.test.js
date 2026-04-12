@@ -83,6 +83,19 @@ module.exports = (async function () {
   assert.strictEqual(pollForChangesCalls, 0, "initial load should refresh token, not poll for stale changes");
   assert.strictEqual(savedToken, "fresh-token", "initial load should refresh the changes page token");
 
+  // Cold start candidate should trigger sync immediately
+  runSyncNowCalls = 0;
+  plugin.isColdStartCandidate = () => true;
+  plugin.stateStore = {
+    async load() { return { outbox: [], cursorByDevice: {}, files: {} }; },
+    async save() {}
+  };
+  await plugin.runInitialSyncIfNeeded();
+  assert.strictEqual(runSyncNowCalls, 1, "cold start candidate should trigger immediate sync");
+
+  runSyncNowCalls = 0;
+  plugin.isColdStartCandidate = () => false;
+
   const classSet = new Set();
   plugin.ribbonIconEl = {
     addClass(name) { classSet.add(name); },

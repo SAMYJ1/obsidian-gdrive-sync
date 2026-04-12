@@ -5,11 +5,13 @@ import { isIgnoredPath } from "../vault/filter";
 import { computeBlobHash } from "../utils/hash";
 import { computeBlobHashSync, isBinaryPath, mergeRemoteText } from "./merge";
 import { pullRemoteOperations } from "./pull";
-import { pushOutboxEntry } from "./push";
+import { pushOutboxEntry, publishOutboxEntry } from "./push";
+import { commitManifestPatch } from "./manifest";
 import {
   normalizeLocalState,
   reserveOperation,
   bindReservedOperation,
+  markOperationCommitted,
   updateTrackedFile,
   removeTrackedFile,
   pruneStaleReservedEntries,
@@ -436,20 +438,41 @@ export class SyncEngine {
     let pushHadVersionConflict = false;
     let consecutiveFailures = 0;
     const maxConsecutiveFailures = 5;
-    console.log(`obsidian-gdrive-sync: push phase starting, ${state.outbox.length} outbox entries`);
-    for (const entry of state.outbox.slice()) {
-      if (entry.status !== "pending" && entry.status !== "published") {
-        continue;
-      }
+    const pendingEntries = state.outbox.filter(
+      (e: any) => e.status === "pending" || e.status === "published"
+    );
+    console.log(`obsidian-gdrive-sync: push phase starting, ${pendingEntries.length} outbox entries`);
+
+    // For large batches (bootstrap), publish all entries first (upload blobs +
+    // append ops), then do a SINGLE manifest commit at the end.  This reduces
+    // Drive API calls from 3N to N+2 (N blob uploads, N op appends, 1 manifest
+    // read-write).  For small batches we keep the per-entry commit for
+    // incremental durability.
+    const useBatchCommit = pendingEntries.length > 5;
+    const publishedEntries: any[] = [];
+
+    for (const entry of pendingEntries) {
       try {
-        state = await pushOutboxEntry({
-          backend: this.backend,
-          deviceId: this.deviceId,
-          entry,
-          state,
-          vaultAdapter: this.vaultAdapter,
-          stateStore: this.stateStore
-        });
+        if (useBatchCommit) {
+          state = await publishOutboxEntry({
+            backend: this.backend,
+            deviceId: this.deviceId,
+            entry,
+            state,
+            vaultAdapter: this.vaultAdapter,
+            stateStore: this.stateStore
+          });
+          publishedEntries.push(entry);
+        } else {
+          state = await pushOutboxEntry({
+            backend: this.backend,
+            deviceId: this.deviceId,
+            entry,
+            state,
+            vaultAdapter: this.vaultAdapter,
+            stateStore: this.stateStore
+          });
+        }
         consecutiveFailures = 0;
 
         if (entry.op === "delete") {
@@ -465,7 +488,6 @@ export class SyncEngine {
           changedPaths.add(entry.path);
         }
       } catch (pushError: any) {
-        // Spec §2: version conflict (409) should trigger conflict merge via pull
         if (pushError && pushError.versionConflict) {
           console.warn(`obsidian-gdrive-sync: version conflict for entry seq=${entry.seq}, will merge after pull`);
           pushHadVersionConflict = true;
@@ -473,11 +495,58 @@ export class SyncEngine {
           console.warn(`obsidian-gdrive-sync: push failed for entry seq=${entry.seq}`, pushError);
           pushHadErrors = true;
           consecutiveFailures++;
-          // Stop trying more entries if we hit too many consecutive failures
-          // (likely a systemic issue like auth or network failure)
           if (consecutiveFailures >= maxConsecutiveFailures) {
             console.warn(`obsidian-gdrive-sync: ${maxConsecutiveFailures} consecutive push failures, stopping push phase`);
             break;
+          }
+        }
+      }
+    }
+
+    // Batch manifest commit: one write covers all published entries.
+    if (useBatchCommit && publishedEntries.length > 0) {
+      try {
+        const batchFiles = publishedEntries.map((entry: any) => {
+          const patch: Record<string, unknown> = {
+            path: entry.path,
+            op: entry.op,
+            fileId: entry.fileId,
+            lastModifiedBy: this.deviceId,
+            updatedAt: entry.ts,
+            seq: entry.seq
+          };
+          if (entry.newPath) patch.newPath = entry.newPath;
+          if (entry.op !== "delete") {
+            patch.blobHash = entry.blobHash;
+            patch.size = typeof entry.content === "string" ? entry.content.length : undefined;
+            patch.mtime = entry.mtime || entry.ts;
+          }
+          return patch;
+        });
+        await this.backend.commitManifest({
+          deviceId: this.deviceId,
+          files: batchFiles
+        });
+        // Mark all published entries as committed in one pass
+        for (const entry of publishedEntries) {
+          state = markOperationCommitted(state, entry.seq);
+        }
+        await this.stateStore.save(state);
+        console.log(`obsidian-gdrive-sync: batch committed ${publishedEntries.length} entries`);
+      } catch (batchError) {
+        console.warn("obsidian-gdrive-sync: batch manifest commit failed, falling back to per-entry", batchError);
+        // Fallback: commit individually
+        for (const entry of publishedEntries) {
+          try {
+            await commitManifestPatch({
+              backend: this.backend,
+              deviceId: this.deviceId,
+              entry
+            });
+            state = markOperationCommitted(state, entry.seq);
+            await this.stateStore.save(state);
+          } catch (individualError) {
+            console.warn(`obsidian-gdrive-sync: fallback commit failed for seq=${entry.seq}`, individualError);
           }
         }
       }

@@ -108,7 +108,7 @@ export function markOperationCommitted(state: LocalState, seq: number): LocalSta
 
 export function updateCursorVector(state: LocalState, cursorByDevice: Record<string, number>): LocalState {
   const next = normalizeLocalState(cloneState(state));
-  next.cursorByDevice = { ...(cursorByDevice || {}) };
+  next.cursorByDevice = { ...next.cursorByDevice, ...(cursorByDevice || {}) };
   return next;
 }
 
