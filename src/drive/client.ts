@@ -920,10 +920,8 @@ export class GoogleDriveClient {
 
   async uploadBlob(change: { blobHash: string; content?: string | Uint8Array | Buffer }): Promise<{ blobHash: string }> {
     const logicalPath = `blobs/${change.blobHash}`;
-    const existing = await this.findByLogicalPath(logicalPath);
-    if (!existing) {
-      await this.writeFile(logicalPath, change.content ?? "");
-    }
+    // Let createOrUpdateFile handle the existence check — avoids redundant findByLogicalPath
+    await this.createOrUpdateFile(logicalPath, change.content ?? "", "application/octet-stream", "file");
     return { blobHash: change.blobHash };
   }
 

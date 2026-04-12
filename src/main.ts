@@ -397,16 +397,18 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
       this.writeDebugLog("sync-complete", "sync cycle finished");
       // After sync, refresh the changes page token so the next poll
       // starts from after our own Drive writes and won't re-trigger sync.
-      // Wait briefly for Drive's eventual consistency to settle.
-      try {
-        await new Promise(resolve => setTimeout(resolve, 5000));
-        const freshToken = await this.backend.getStartPageToken();
-        let postSyncState = await this.stateStore.load();
-        postSyncState = updateChangesPageToken(postSyncState, freshToken);
-        await this.stateStore.save(postSyncState);
-      } catch (tokenError) {
-        console.warn("obsidian-gdrive-sync: failed to refresh page token after sync", tokenError);
-      }
+      // Run in background — don't block the sync completion.
+      (async () => {
+        try {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          const freshToken = await this.backend.getStartPageToken();
+          let postSyncState = await this.stateStore.load();
+          postSyncState = updateChangesPageToken(postSyncState, freshToken);
+          await this.stateStore.save(postSyncState);
+        } catch (tokenError) {
+          console.warn("obsidian-gdrive-sync: failed to refresh page token after sync", tokenError);
+        }
+      })();
     } catch (syncError: unknown) {
       this.writeDebugLog("sync-error", syncError);
     } finally {

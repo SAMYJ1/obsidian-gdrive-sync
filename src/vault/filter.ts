@@ -2,6 +2,7 @@ export const BUILT_IN_IGNORE_PATHS: string[] = [
   ".obsidian/plugins/obsidian-gdrive-sync/**",
   ".obsidian/workspace.json",
   ".obsidian/workspace-mobile.json",
+  ".obsidian/cache",
   ".trash/**",
   ".DS_Store"
 ];
@@ -28,14 +29,18 @@ function matchesPattern(filePath: string, pattern: string): boolean {
   if (pattern.includes("*") || pattern.includes("?")) {
     return globMatch(filePath, pattern);
   }
+  // Bare name without "/" matches at any level (like .gitignore)
+  if (!pattern.includes("/")) {
+    const fileName = filePath.split("/").pop() || "";
+    return filePath === pattern || fileName === pattern;
+  }
   return filePath === pattern;
 }
 
 export function isIgnoredPath(filePath: string, extraPatterns: string[] = []): boolean {
   const patterns = BUILT_IN_IGNORE_PATHS.concat(extraPatterns || []);
-  // Default: ignore files in hidden directories/dotfiles.
-  // Any path segment starting with "." is hidden by convention.
-  let ignored = filePath.split("/").some(s => s.startsWith("."));
+  // No blanket dotfile ignore — only explicit patterns control filtering.
+  let ignored = false;
   patterns.forEach((pattern) => {
     if (!pattern) {
       return;

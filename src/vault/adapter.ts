@@ -12,19 +12,34 @@ export class ObsidianVaultAdapter {
   }
 
   async readChangeContent(filePath: string): Promise<string | Uint8Array> {
+    // Try Obsidian's managed file API first (works for non-hidden files)
     const file = this.app.vault.getAbstractFileByPath(filePath);
-    if (!(file instanceof obsidian.TFile)) {
-      return "";
+    if (file instanceof obsidian.TFile) {
+      const bytes = await this.app.vault.readBinary(file);
+      if (isBinaryPath(filePath)) {
+        return new Uint8Array(bytes);
+      }
+      if (typeof Buffer !== "undefined") {
+        return Buffer.from(bytes).toString("utf8");
+      }
+      return new TextDecoder().decode(bytes);
     }
-    const bytes = await this.app.vault.readBinary(file);
-    // Return raw bytes for binary files to avoid UTF-8 corruption
-    if (isBinaryPath(filePath)) {
-      return new Uint8Array(bytes);
+    // Fallback to vault adapter for hidden/dotfiles not in Obsidian's file index
+    if (this.app.vault.adapter && typeof this.app.vault.adapter.readBinary === "function") {
+      try {
+        const bytes = await this.app.vault.adapter.readBinary(filePath);
+        if (isBinaryPath(filePath)) {
+          return new Uint8Array(bytes);
+        }
+        if (typeof Buffer !== "undefined") {
+          return Buffer.from(bytes).toString("utf8");
+        }
+        return new TextDecoder().decode(bytes);
+      } catch {
+        return "";
+      }
     }
-    if (typeof Buffer !== "undefined") {
-      return Buffer.from(bytes).toString("utf8");
-    }
-    return new TextDecoder().decode(bytes);
+    return "";
   }
 
   async applyRemoteOperation(entry: any): Promise<void> {
@@ -132,18 +147,35 @@ export class ObsidianVaultAdapter {
   }
 
   async listSnapshotFiles(ignorePatterns: string[] = []): Promise<Array<{ path: string; content: string | Uint8Array }>> {
-    const files = this.app.vault.getFiles ? this.app.vault.getFiles() : [];
+    // Use adapter.list() to discover ALL files including hidden/dotfiles
+    // (app.vault.getFiles() only returns Obsidian-managed non-hidden files)
+    const allPaths = await this.walkAdapterFiles("");
     const snapshotFiles: Array<{ path: string; content: string | Uint8Array }> = [];
-    for (const file of files) {
-      if (!file || !file.path || isIgnoredPath(file.path, ignorePatterns)) {
+    for (const filePath of allPaths) {
+      if (!filePath || isIgnoredPath(filePath, ignorePatterns)) {
         continue;
       }
       snapshotFiles.push({
-        path: file.path,
-        content: await this.readChangeContent(file.path)
+        path: filePath,
+        content: await this.readChangeContent(filePath)
       });
     }
     snapshotFiles.sort((a, b) => a.path.localeCompare(b.path));
     return snapshotFiles;
+  }
+
+  private async walkAdapterFiles(dir: string): Promise<string[]> {
+    const adapter = this.app.vault.adapter;
+    if (!adapter || typeof adapter.list !== "function") {
+      // Fallback to getFiles() if adapter.list isn't available
+      return (this.app.vault.getFiles ? this.app.vault.getFiles() : []).map((f: any) => f.path);
+    }
+    const result = await adapter.list(dir);
+    const files: string[] = [...(result.files || [])];
+    for (const folder of result.folders || []) {
+      const children = await this.walkAdapterFiles(folder);
+      files.push(...children);
+    }
+    return files;
   }
 }

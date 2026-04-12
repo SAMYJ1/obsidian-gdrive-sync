@@ -563,16 +563,15 @@ export class SyncEngine {
 
     // Advance cursorByDevice for own device after push so the pull phase
     // doesn't re-fetch ops we just committed (prevents feedback loop).
-    if (typeof this.backend.readManifest === "function") {
-      try {
-        const postPushManifest = await this.backend.readManifest();
-        const ownOpsHead = postPushManifest?.devices?.[this.deviceId]?.opsHead;
-        if (typeof ownOpsHead === "number" && ownOpsHead > (state.cursorByDevice?.[this.deviceId] ?? 0)) {
-          state = updateCursorVector(state, { [this.deviceId]: ownOpsHead });
-          await this.stateStore.save(state);
-        }
-      } catch (cursorError) {
-        console.warn("obsidian-gdrive-sync: failed to advance own cursor after push", cursorError);
+    // Compute locally from committed entries — no extra API call needed.
+    if (pendingEntries.length > 0) {
+      const maxCommittedSeq = Math.max(
+        state.cursorByDevice?.[this.deviceId] ?? 0,
+        ...pendingEntries.map((e: any) => e.seq)
+      );
+      if (maxCommittedSeq > (state.cursorByDevice?.[this.deviceId] ?? 0)) {
+        state = updateCursorVector(state, { [this.deviceId]: maxCommittedSeq });
+        await this.stateStore.save(state);
       }
     }
 
@@ -587,8 +586,11 @@ export class SyncEngine {
 
     onPhaseChange("pulling");
 
-    // Spec §3: reconciliation pass runs at the start of each pull
-    await this.reconcileUncommittedOps();
+    // Spec §3: reconciliation pass — skip after a successful push since
+    // we just committed the manifest and our ops are known-committed.
+    if (pushHadErrors || pendingEntries.length === 0) {
+      await this.reconcileUncommittedOps();
+    }
     let remoteOperations: any[] = [];
     try {
       const pullResult = await pullRemoteOperations({
@@ -660,39 +662,53 @@ export class SyncEngine {
     // triggers the poll, causing an infinite sync loop.
     const hasSnapshotChanges = changedFiles.length > 0 || deletedPaths.size > 0 || renamedFiles.length > 0;
     if (hasSnapshotChanges) {
-      try {
-        const previousSnapshotMeta = settings.snapshotPublishMode === "generations" &&
-          typeof this.backend.readSnapshotMeta === "function"
-          ? await this.backend.readSnapshotMeta(settings)
-          : null;
-        await this.backend.publishSnapshot({
-          snapshotPublishMode: settings.snapshotPublishMode,
-          nextGenerationId: `gen-${this.now()}`,
-          previousGenerationId: previousSnapshotMeta && previousSnapshotMeta.generationId,
-          snapshotSeqs: state.cursorByDevice,
-          previousFiles: Object.keys(state.files || {}).map((filePath: string) => `vault/${filePath}`),
-          changedFiles,
-          deletedFiles: Array.from(deletedPaths),
-          renamedFiles,
-          files: changedFiles
+      // For small incremental changes, publish snapshot in background (non-blocking)
+      // to keep sync completion fast. Large batches wait for snapshot synchronously.
+      const snapshotPayload: any = {
+        snapshotPublishMode: settings.snapshotPublishMode,
+        nextGenerationId: `gen-${this.now()}`,
+        snapshotSeqs: state.cursorByDevice,
+        previousFiles: Object.keys(state.files || {}).map((filePath: string) => `vault/${filePath}`),
+        changedFiles,
+        deletedFiles: Array.from(deletedPaths),
+        renamedFiles,
+        files: changedFiles
+      };
+      if (changedFiles.length <= 3) {
+        // Background publish — don't block sync completion
+        this.backend.publishSnapshot(snapshotPayload).catch((err: unknown) => {
+          console.warn("obsidian-gdrive-sync: background snapshot publish failed", err);
         });
-      } catch (snapshotError) {
-        console.warn("obsidian-gdrive-sync: snapshot publish failed", snapshotError);
+      } else {
+        try {
+          const previousSnapshotMeta = settings.snapshotPublishMode === "generations" &&
+            typeof this.backend.readSnapshotMeta === "function"
+            ? await this.backend.readSnapshotMeta(settings)
+            : null;
+          snapshotPayload.previousGenerationId = previousSnapshotMeta && previousSnapshotMeta.generationId;
+          await this.backend.publishSnapshot(snapshotPayload);
+        } catch (snapshotError) {
+          console.warn("obsidian-gdrive-sync: snapshot publish failed", snapshotError);
+        }
       }
     }
 
-    try {
-      await this.maybeCompact(state, settings);
-    } catch (compactionError) {
-      console.warn("obsidian-gdrive-sync: compaction failed", compactionError);
-    }
-
-    // Spec §3: periodic blob GC runs independently of compaction
-    if (typeof this.backend.garbageCollectBlobs === "function") {
+    // Skip expensive compaction and blob GC for small incremental syncs.
+    // Only run when the outbox had enough entries to justify the overhead.
+    const totalChanges = changedPaths.size + deletedPaths.size;
+    if (totalChanges > 10) {
       try {
-        await this.backend.garbageCollectBlobs();
-      } catch (gcError) {
-        console.warn("obsidian-gdrive-sync: blob GC failed", gcError);
+        await this.maybeCompact(state, settings);
+      } catch (compactionError) {
+        console.warn("obsidian-gdrive-sync: compaction failed", compactionError);
+      }
+
+      if (typeof this.backend.garbageCollectBlobs === "function") {
+        try {
+          await this.backend.garbageCollectBlobs();
+        } catch (gcError) {
+          console.warn("obsidian-gdrive-sync: blob GC failed", gcError);
+        }
       }
     }
 

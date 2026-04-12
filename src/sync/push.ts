@@ -25,20 +25,6 @@ export async function publishOutboxEntry(input: PushOutboxEntryInput): Promise<a
   const entry = input.entry;
 
   if (entry.status === "pending") {
-    if (entry.op !== "delete") {
-      let uploadEntry = entry;
-      if (uploadEntry.content == null) {
-        const contentPath = entry.op === "rename" && entry.newPath ? entry.newPath : entry.path;
-        if (!contentPath || !input.vaultAdapter || typeof input.vaultAdapter.readChangeContent !== "function") {
-          throw new Error(`Missing content for pending entry seq=${entry.seq}`);
-        }
-        uploadEntry = {
-          ...entry,
-          content: await input.vaultAdapter.readChangeContent(contentPath)
-        };
-      }
-      await retryWithBackoff(() => input.backend.uploadBlob(uploadEntry));
-    }
     const opPayload: Record<string, unknown> = {
       seq: entry.seq,
       device: input.deviceId,
@@ -53,9 +39,30 @@ export async function publishOutboxEntry(input: PushOutboxEntryInput): Promise<a
       opPayload.blobHash = entry.blobHash;
       opPayload.mtime = entry.mtime || entry.ts;
     }
-    const publishResult = await retryWithBackoff(() =>
+
+    // Blob upload and op append write to independent files — run in parallel
+    const blobPromise = entry.op !== "delete"
+      ? (async () => {
+          let uploadEntry = entry;
+          if (uploadEntry.content == null) {
+            const contentPath = entry.op === "rename" && entry.newPath ? entry.newPath : entry.path;
+            if (!contentPath || !input.vaultAdapter || typeof input.vaultAdapter.readChangeContent !== "function") {
+              throw new Error(`Missing content for pending entry seq=${entry.seq}`);
+            }
+            uploadEntry = {
+              ...entry,
+              content: await input.vaultAdapter.readChangeContent(contentPath)
+            };
+          }
+          return retryWithBackoff(() => input.backend.uploadBlob(uploadEntry));
+        })()
+      : Promise.resolve();
+
+    const opPromise = retryWithBackoff(() =>
       input.backend.appendOperation(opPayload)
     );
+
+    const [, publishResult] = await Promise.all([blobPromise, opPromise]);
     state = markOperationPublished(state, entry.seq, publishResult as Record<string, unknown>);
     await input.stateStore.save(state);
   }
