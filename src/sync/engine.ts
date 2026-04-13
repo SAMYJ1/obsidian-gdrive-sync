@@ -59,6 +59,7 @@ export async function coldStart(options: {
   }
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    console.log(`obsidian-gdrive-sync: coldStart() attempt ${attempt + 1}/${maxAttempts}`);
     const snapshotMetaBefore = await backend.readSnapshotMeta(settings);
     const manifest = await backend.readManifest();
     const snapshotSeqs: Record<string, number> = { ...((snapshotMetaBefore && snapshotMetaBefore.snapshotSeqs) || {}) };
@@ -430,6 +431,13 @@ export class SyncEngine {
       });
       this.fullSnapshotNeeded = true;
       state = await this.loadState();
+      // Clear any outbox entries created by vault watcher during cold start.
+      // Cold start has already downloaded and tracked all files from the remote.
+      if (state.outbox.length > 0) {
+        console.log(`obsidian-gdrive-sync: clearing ${state.outbox.length} spurious outbox entries from vault watcher after cold start`);
+        state = normalizeLocalState({ ...state, outbox: [] });
+        await this.stateStore.save(state);
+      }
     }
 
     // Dedup outbox: remove pending "create" entries that are clearly duplicates from the
@@ -1410,8 +1418,9 @@ export class SyncEngine {
       try {
         const manifest = await this.backend.readManifest(settings);
         const device = manifest && manifest.devices ? manifest.devices[this.deviceId] : null;
-        return Boolean(device && device.status === "inactive");
-      } catch {
+        const result = Boolean(device && device.status === "inactive");
+        return result;
+      } catch (err) {
         return false;
       }
     }
@@ -1425,13 +1434,14 @@ export class SyncEngine {
     try {
       const manifest = await this.backend.readManifest(settings);
       const snapshotMeta = await this.backend.readSnapshotMeta(settings);
-      return Boolean(
+      const result = Boolean(
         Object.keys(manifest?.devices || {}).length > 0 ||
         Object.keys(manifest?.files || {}).length > 0 ||
         Object.keys(snapshotMeta?.snapshotSeqs || {}).length > 0 ||
         snapshotMeta?.generationId
       );
-    } catch {
+      return result;
+    } catch (err) {
       return false;
     }
   }

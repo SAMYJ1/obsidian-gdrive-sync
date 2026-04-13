@@ -190,7 +190,9 @@ class ObsidianGDriveSyncPlugin extends obsidian.Plugin {
   }
 
   getRuntimeStatePath(): string {
-    return this.app.vault.configDir + "/plugins/" + this.manifest.id + "/runtime-state.json";
+    const basePath = (this.app.vault.adapter as any).getBasePath?.() || "";
+    const rel = this.app.vault.configDir + "/plugins/" + this.manifest.id + "/runtime-state.json";
+    return basePath ? basePath + "/" + rel : rel;
   }
 
   getBuiltInIgnorePaths(): string[] {

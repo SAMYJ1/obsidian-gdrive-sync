@@ -1266,7 +1266,13 @@ export class GoogleDriveClient {
     const files = await this.listManagedFiles();
     const snapshotFiles = files.filter((file) => {
       const logicalPath = file.appProperties?.logicalPath;
-      return Boolean(logicalPath && logicalPath.startsWith(prefix) && logicalPath.slice(prefix.length) !== "_snapshot_meta.json");
+      if (!logicalPath || !logicalPath.startsWith(prefix)) return false;
+      if (logicalPath.slice(prefix.length) === "_snapshot_meta.json") return false;
+      // Exclude folders — they can't be downloaded with alt=media
+      if (file.mimeType === "application/vnd.google-apps.folder") return false;
+      const kind = file.appProperties?.kind;
+      if (kind === "folder" || kind === "vault-root") return false;
+      return true;
     });
     snapshotFiles.sort((left, right) =>
       (left.appProperties?.logicalPath ?? "").localeCompare(right.appProperties?.logicalPath ?? "")

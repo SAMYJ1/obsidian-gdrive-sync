@@ -104,7 +104,9 @@ export class ObsidianVaultAdapter {
     for (const part of parts) {
       current = current ? current + "/" + part : part;
       if (!this.app.vault.getAbstractFileByPath(current)) {
-        await this.app.vault.createFolder(current);
+        try {
+          await this.app.vault.createFolder(current);
+        } catch { /* folder may already exist from a concurrent write */ }
       }
     }
   }
@@ -116,7 +118,18 @@ export class ObsidianVaultAdapter {
         await this.app.vault.modifyBinary(existing, content.buffer);
       } else {
         await this.ensureParentFolder(filePath);
-        await this.app.vault.createBinary(filePath, content.buffer);
+        try {
+          await this.app.vault.createBinary(filePath, content.buffer);
+        } catch {
+          // File may already exist on disk but not yet in Obsidian's index
+          const retryExisting = this.app.vault.getAbstractFileByPath(filePath);
+          if (retryExisting) {
+            await this.app.vault.modifyBinary(retryExisting, content.buffer);
+          } else {
+            // Fall back to raw adapter write
+            await this.app.vault.adapter.writeBinary(filePath, content.buffer);
+          }
+        }
       }
       return;
     }
@@ -124,7 +137,16 @@ export class ObsidianVaultAdapter {
       await this.app.vault.modify(existing, content);
     } else {
       await this.ensureParentFolder(filePath);
-      await this.app.vault.create(filePath, content);
+      try {
+        await this.app.vault.create(filePath, content);
+      } catch {
+        const retryExisting = this.app.vault.getAbstractFileByPath(filePath);
+        if (retryExisting) {
+          await this.app.vault.modify(retryExisting, content);
+        } else {
+          await this.app.vault.adapter.write(filePath, content);
+        }
+      }
     }
   }
 
