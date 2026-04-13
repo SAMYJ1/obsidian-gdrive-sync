@@ -399,7 +399,7 @@ Then use `Sync now` whenever you want to sync.
 
 ## Agent Setup Guide
 
-For an automation-oriented install/configuration checklist, see [docs/agent-install-config.md](/Volumes/disk1/Users/mayijian/code/obsidian-gdrive-sync/docs/agent-install-config.md).
+For an automation-oriented install/configuration checklist, see [docs/agent-install-config.md](docs/agent-install-config.md).
 
 ## Development
 
